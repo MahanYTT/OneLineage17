@@ -316,77 +316,100 @@ TAKEOVER_PID=$!
 echo "Takeover daemon PID: $TAKEOVER_PID"
 
 # Start UI Activator daemon
-$BB sh -c "
-BB=\"$BB\"
-[ -n \"\$BB\" ] || BB=\$(which busybox 2>/dev/null || echo /data/adb/ksu/bin/busybox)
+cat > /data/local/tmp/ui_activator.sh <<'UIACT'
+#!/system/bin/sh
+STAGE="/data/local/tmp/lineage_stage"
+BB=$(which busybox 2>/dev/null || echo "/data/adb/ksu/bin/busybox")
+[ -x "$BB" ] || BB=$(find /data/adb /system /data -name busybox 2>/dev/null | head -n 1)
+
+ready_count=0
 while true; do
     sleep 2
-    PID=\$(pidof system_server | awk '{print \$1}')
-    if [ -n \"\$PID\" ]; then
-        echo "[UI Activator] system_server PID=\$PID alive, checking WindowManager..." >> /data/local/tmp/ui_activator.log
-        if $BB nsenter -t \$PID -m /system/bin/dumpsys window 2>/dev/null | grep -q 'mStatusBar'; then
+    PID=$(pidof system_server | awk '{print $1}')
+    if [ -n "$PID" ]; then
+        echo "[UI Activator] system_server PID=$PID alive, checking readiness..."
+        is_ready=0
+        if $BB nsenter -t $PID -m /system/bin/dumpsys window 2>/dev/null | grep -E -q 'mStatusBar|StatusBar'; then
+            echo "[UI Activator] StatusBar found in WindowManager!"
+            is_ready=1
+        elif [ "$($BB nsenter -t $PID -m /system/bin/getprop sys.boot_completed 2>/dev/null)" = "1" ]; then
+            echo "[UI Activator] sys.boot_completed is 1!"
+            is_ready=1
+        fi
+
+        ready_count=$((ready_count + 1))
+        # Failsafe: if system_server has been up for 45s, dismiss boot animation
+        if [ "$ready_count" -ge 22 ]; then
+            echo "[UI Activator] Failsafe: system_server up for 45s, proceeding to activate UI..."
+            is_ready=1
+        fi
+
+        if [ "$is_ready" = "1" ]; then
             echo '[UI Activator] WindowManager is ready! Dismissing bootanim and unlocking...'
             setprop service.bootanim.exit 1
-            kill -9 \$(pidof bootanimation) 2>/dev/null
+            kill -9 $(pidof bootanimation) 2>/dev/null
             sleep 1
-            $BB nsenter -t \$PID -m /system/bin/svc power stayon true
-            $BB nsenter -t \$PID -m /system/bin/settings put global stay_on_while_plugged_in 7
-            $BB nsenter -t \$PID -m /system/bin/settings put system screen_off_timeout 2147483647
-            $BB nsenter -t \$PID -m /system/bin/settings put system haptic_feedback_enabled 1
-            $BB nsenter -t \$PID -m /system/bin/settings put system peak_refresh_rate 120.0
-            $BB nsenter -t \$PID -m /system/bin/settings put system min_refresh_rate 120.0
-            # Gesture navigation. The GSI boots with the three-button overlay, and
-            # this line used to force it back on every takeover.
-            $BB nsenter -t \$PID -m /system/bin/cmd overlay enable-exclusive --category com.android.internal.systemui.navbar.gestural 2>/dev/null || true
-            $BB nsenter -t \$PID -m /system/bin/settings put secure navigation_mode 2 2>/dev/null || true
-            $BB nsenter -t \$PID -m /system/bin/pm disable android.ext.services/android.ext.services.notification.Assistant 2>/dev/null || true
-            $BB nsenter -t \$PID -m /system/bin/input keyevent 224
-            $BB nsenter -t \$PID -m /system/bin/input keyevent 82
-            $BB nsenter -t \$PID -m /system/bin/am unlock-user 0
-            $BB nsenter -t \$PID -m /system/bin/am start -a android.intent.action.MAIN -c android.intent.category.HOME
+            $BB nsenter -t $PID -m /system/bin/svc power stayon true
+            $BB nsenter -t $PID -m /system/bin/settings put global stay_on_while_plugged_in 7
+            $BB nsenter -t $PID -m /system/bin/settings put system screen_off_timeout 2147483647
+            $BB nsenter -t $PID -m /system/bin/settings put system haptic_feedback_enabled 1
+            $BB nsenter -t $PID -m /system/bin/settings put system peak_refresh_rate 120.0
+            $BB nsenter -t $PID -m /system/bin/settings put system min_refresh_rate 120.0
+            $BB nsenter -t $PID -m /system/bin/cmd overlay enable-exclusive --category com.android.internal.systemui.navbar.gestural 2>/dev/null || true
+            $BB nsenter -t $PID -m /system/bin/settings put secure navigation_mode 2 2>/dev/null || true
+            $BB nsenter -t $PID -m /system/bin/pm disable android.ext.services/android.ext.services.notification.Assistant 2>/dev/null || true
+            $BB nsenter -t $PID -m /system/bin/input keyevent 224
+            $BB nsenter -t $PID -m /system/bin/input keyevent 82
+            $BB nsenter -t $PID -m /system/bin/am unlock-user 0
+            $BB nsenter -t $PID -m /system/bin/am start -a android.intent.action.MAIN -c android.intent.category.HOME
             echo '[UI Activator] Home activated!'
             echo '[UI Activator] Creating missing app data dirs...'
-            $BB nsenter -t \$PID -m /system/bin/sh /data/local/tmp/fix_app_dirs.sh 2>/dev/null || true
+            $BB nsenter -t $PID -m /system/bin/sh /data/local/tmp/fix_app_dirs.sh 2>/dev/null || true
 
             # Install microG if requested
-            if [ -f \"\$STAGE/install_microg.flag\" ]; then
+            if [ -f "$STAGE/install_microg.flag" ]; then
                 echo '[UI Activator] Installing microG components...'
-                for apk in \"\$STAGE/GmsCore.apk\" \"\$STAGE/FakeStore.apk\" /data/local/tmp/GmsCore.apk /data/local/tmp/FakeStore.apk; do
-                    if [ -f \"\$apk\" ]; then
-                        echo \"[UI Activator] Installing \$apk...\"
-                        \$BB nsenter -t \$PID -m /system/bin/pm install -r -g \"\$apk\" 2>/dev/null || true
+                for apk in "$STAGE/GmsCore.apk" "$STAGE/FakeStore.apk" /data/local/tmp/GmsCore.apk /data/local/tmp/FakeStore.apk; do
+                    if [ -f "$apk" ]; then
+                        echo "[UI Activator] Installing $apk..."
+                        $BB nsenter -t $PID -m /system/bin/pm install -r -g "$apk" 2>/dev/null || true
                     fi
                 done
-                rm -f \"\$STAGE/install_microg.flag\" 2>/dev/null || true
+                rm -f "$STAGE/install_microg.flag" 2>/dev/null || true
             fi
 
             # Populate network permissions for all installed packages
-            for uid in \$($BB nsenter -t \$PID -m /system/bin/pm list packages -U 2>/dev/null | grep -o 'uid:[0-9]*' | cut -d: -f2 | sort -u); do
-                [ -n \"\$uid\" ] || continue
-                b0=\$(printf \"%02x\" \$((uid & 0xff)))
-                b1=\$(printf \"%02x\" \$(((uid >> 8) & 0xff)))
-                b2=\$(printf \"%02x\" \$(((uid >> 16) & 0xff)))
-                b3=\$(printf \"%02x\" \$(((uid >> 24) & 0xff)))
-                bpftool map update pinned /sys/fs/bpf/netd_shared/map_netd_uid_permission_map key hex \$b0 \$b1 \$b2 \$b3 value hex 0c 2>/dev/null || true
+            for uid in $($BB nsenter -t $PID -m /system/bin/pm list packages -U 2>/dev/null | grep -o 'uid:[0-9]*' | cut -d: -f2 | sort -u); do
+                [ -n "$uid" ] || continue
+                b0=$(printf "%02x" $((uid & 0xff)))
+                b1=$(printf "%02x" $(((uid >> 8) & 0xff)))
+                b2=$(printf "%02x" $(((uid >> 16) & 0xff)))
+                b3=$(printf "%02x" $(((uid >> 24) & 0xff)))
+                bpftool map update pinned /sys/fs/bpf/netd_shared/map_netd_uid_permission_map key hex $b0 $b1 $b2 $b3 value hex 0c 2>/dev/null || true
             done
 
             # Ensure default routing
-            DEF_IF=\$(ip route | grep -o 'dev [^ ]*' | head -n 1 | awk '{print \$2}')
-            [ -n \"\$DEF_IF\" ] && ip route add default dev \"\$DEF_IF\" 2>/dev/null || true
+            DEF_IF=$(ip route | grep -o 'dev [^ ]*' | head -n 1 | awk '{print $2}')
+            [ -n "$DEF_IF" ] && ip route add default dev "$DEF_IF" 2>/dev/null || true
 
-            # Mount emulated primary storage. Vold needs a moment after boot to
-            # register the emulated volume; retry until the path is accessible
-            # or the attempt limit is reached (vold failing is non-fatal).
+            # Mount emulated primary storage
             _sm_ok=0
             for _attempt in 1 2 3 4 5; do
-                $BB nsenter -t \$PID -m /system/bin/sm mount \"emulated;0\" 2>/dev/null && _sm_ok=1 && break
+                $BB nsenter -t $PID -m /system/bin/sm mount "emulated;0" 2>/dev/null && _sm_ok=1 && break
                 sleep 2
             done
-            echo \"[UI Activator] sm mount result: _sm_ok=\$_sm_ok (attempts: \$_attempt)\"
+            echo "[UI Activator] sm mount result: _sm_ok=$_sm_ok (attempts: $_attempt)"
             break
         fi
     fi
 done
-" </dev/null >/data/local/tmp/ui_activator.log 2>&1 &
+UIACT
+chmod 755 /data/local/tmp/ui_activator.sh
+if command -v setsid >/dev/null 2>&1; then
+    setsid /system/bin/sh /data/local/tmp/ui_activator.sh </dev/null >/data/local/tmp/ui_activator.log 2>&1 &
+else
+    nohup /system/bin/sh /data/local/tmp/ui_activator.sh </dev/null >/data/local/tmp/ui_activator.log 2>&1 &
+fi
+echo "ui_activator started (log: /data/local/tmp/ui_activator.log)"
 
 echo "=== TAKEOVER LAUNCHED SUCCESSFULLY ==="
