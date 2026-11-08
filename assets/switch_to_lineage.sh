@@ -66,54 +66,31 @@ echo "IMS gate: voiceRegState=$ims_st after $((ims_i * 2))s, imsd=${ims_pid:-$(p
 # not reliably restart it, which is the "adb randomly stopped working" symptom.
 # Keep it supervised from the host namespace for the whole session; the watchdog
 # is stopped again by return_to_oneui.sh.
+pkill -f "adb_watchdog.sh" 2>/dev/null || true
 if ! ps -ef 2>/dev/null | grep -v grep | grep -q "adb_watchdog.sh"; then
     cat > /data/local/tmp/adb_watchdog.sh <<'ADBW'
 #!/system/bin/sh
-# Watchdog for the host adbd, which is the only way into the phone while Lineage
-# is up. Two failure modes are handled:
-#   1. adbd simply died -> ask init to start it again.
-#   2. adbd is alive but the USB gadget lost the adb function. The guest's own
-#      UsbService rewrites sys.usb.config during boot, and a plain setprop is a
-#      no-op in that state, so the gadget has to be re-applied by toggling it.
 LOG=/data/local/tmp/adb_watchdog.log
-last_toggle=0
 while true; do
-    sleep 10
+    sleep 3
     st=$(getprop init.svc.adbd)
     usb=$(getprop sys.usb.state)
     cfg=$(getprop sys.usb.config)
-    if [ "$st" != "running" ]; then
-        setprop ctl.start adbd 2>/dev/null
-        echo "$(date) restarted adbd (was: $st, usb.state=$usb, usb.config=$cfg)" >> "$LOG"
-    fi
     case "$cfg" in
         *adb*) ;;
         ""|none)
-            setprop sys.usb.config adb 2>/dev/null
-            echo "$(date) set usb.config to adb (was: $cfg)" >> "$LOG"
+            setprop sys.usb.config sec_charging,adb 2>/dev/null
+            echo "$(date) restored sec_charging,adb (was: $cfg)" >> "$LOG"
             ;;
         *)
             setprop sys.usb.config "$cfg,adb" 2>/dev/null
             echo "$(date) added adb to usb.config (was: $cfg)" >> "$LOG"
             ;;
     esac
-    case "$usb" in
-        *adb*) ;;
-        *)
-            now=$(date +%s 2>/dev/null || echo 0)
-            if [ $((now - last_toggle)) -gt 30 ]; then
-                last_toggle=$now
-                echo "$(date) gadget lost adb, toggling (state: $usb, config: $cfg)" >> "$LOG"
-                setprop sys.usb.config none 2>/dev/null
-                sleep 1
-                setprop sys.usb.config mtp,adb 2>/dev/null
-                sleep 1
-                [ "$(getprop sys.usb.state)" = "none" ] && setprop sys.usb.config adb 2>/dev/null
-                sleep 1
-                setprop ctl.start adbd 2>/dev/null
-            fi
-            ;;
-    esac
+    if [ "$st" != "running" ]; then
+        setprop ctl.start adbd 2>/dev/null
+        echo "$(date) restarted adbd (was: $st, usb.state=$usb, usb.config=$cfg)" >> "$LOG"
+    fi
 done
 ADBW
     chmod 755 /data/local/tmp/adb_watchdog.sh
@@ -124,6 +101,13 @@ ADBW
     fi
     echo "adbd watchdog started (log: /data/local/tmp/adb_watchdog.log)"
 fi
+
+# Start persistent logcat capture for takeover diagnostics
+pkill -f "takeover_logcat.log" 2>/dev/null || true
+rm -f /data/local/tmp/takeover_logcat.log 2>/dev/null || true
+nohup logcat -f /data/local/tmp/takeover_logcat.log </dev/null >/dev/null 2>&1 &
+sleep 0.2
+chmod 666 /data/local/tmp/takeover_logcat.log 2>/dev/null || true
 
 # --- IMS KEEPALIVE --------------------------------------------------------
 # imsd is the daemon holding the modem's IMS registration (see the IMS gate
