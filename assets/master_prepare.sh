@@ -512,6 +512,28 @@ if [ -z "$iface" ]; then
     done
 fi
 [ -z "$iface" ] && exit 0
+# --- DNS self-heal ---------------------------------------------------------
+# After boot and after every wifi reconnect the guest resolver can sit on a
+# netId the host netd does not know: apps get "Unable to resolve host" /
+# ENONET even though IP connectivity works (observed: fails ~30 s, then fixes
+# itself, then breaks again on the next network re-creation). If raw IP works
+# but names do not, flush the resolver cache and bounce wifi, at most once per
+# 90 s.
+if ping -c1 -W2 1.1.1.1 >/dev/null 2>&1 || ping -c1 -W2 8.8.8.8 >/dev/null 2>&1; then
+    if ! ping -c1 -W3 connectivitycheck.gstatic.com >/dev/null 2>&1; then
+        now=$(date +%s)
+        last=$(cat /data/net_dns_fix.ts 2>/dev/null)
+        if [ -z "$last" ] || [ $((now - last)) -ge 90 ]; then
+            echo "$now" > /data/net_dns_fix.ts
+            ndc resolver flushdefaultif >/dev/null 2>&1
+            ndc resolver flushnet 100 >/dev/null 2>&1
+            case "$iface" in
+                wlan*) svc wifi disable >/dev/null 2>&1; sleep 2; svc wifi enable >/dev/null 2>&1 ;;
+            esac
+            echo "dns self-heal: names failed with IP up on $iface, resolver flushed"
+        fi
+    fi
+fi
 subnet=$(ip route show table all 2>/dev/null | awk -v d="$iface" \
     '$2=="dev" && $3==d && $0 ~ /scope link/ && $1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\// {print $1; exit}')
 [ -z "$subnet" ] && exit 0

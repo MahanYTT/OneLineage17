@@ -77,6 +77,12 @@ while true; do
     usb=$(getprop sys.usb.state)
     cfg=$(getprop sys.usb.config)
     case "$cfg" in
+        adb)
+            # Lineage's UsbDeviceManager rewrites the config to bare "adb", which
+            # Samsung's init does not know: the gadget drops and adb disappears.
+            setprop sys.usb.config sec_charging,adb 2>/dev/null
+            echo "$(date) bare adb -> sec_charging,adb" >> "$LOG"
+            ;;
         *adb*) ;;
         ""|none)
             setprop sys.usb.config sec_charging,adb 2>/dev/null
@@ -105,7 +111,10 @@ fi
 # Start persistent logcat capture for takeover diagnostics
 pkill -f "takeover_logcat.log" 2>/dev/null || true
 rm -f /data/local/tmp/takeover_logcat.log 2>/dev/null || true
-nohup logcat -f /data/local/tmp/takeover_logcat.log </dev/null >/dev/null 2>&1 &
+# Rotating, capped capture (4 MB x 3 files, crash+system buffers only). The old
+# unbounded `logcat -f` grew past 14 GB and kept flash/CPU busy for no reason.
+rm -f /data/local/tmp/takeover_logcat.log.* 2>/dev/null || true
+nohup logcat -b crash,system -r 4096 -n 3 -f /data/local/tmp/takeover_logcat.log </dev/null >/dev/null 2>&1 &
 sleep 0.2
 chmod 666 /data/local/tmp/takeover_logcat.log 2>/dev/null || true
 
@@ -346,6 +355,19 @@ while true; do
             setprop service.bootanim.exit 1
             kill -9 $(pidof bootanimation) 2>/dev/null
             sleep 1
+            # Display size: the guest inherits the panel's native 600 dpi (384 dp wide),
+            # which makes AOSP UI oversized. Apply a saner density. Override by writing
+            # a number to /data/local/tmp/lineage_stage/density (e.g. 500, 540, 560).
+            LDENS=$(cat "$STAGE/density" 2>/dev/null | tr -dc '0-9')
+            [ -n "$LDENS" ] || LDENS=540
+            $BB nsenter -t $PID -m /system/bin/wm density "$LDENS" 2>/dev/null || true
+            # GMS from the host is Android 17 and crash-loops against Android 16's
+            # SafetyCenter, JIT-compiling from scratch every ~5 s (the 100C heat).
+            $BB nsenter -t $PID -m /system/bin/device_config put privacy safety_center_is_enabled false 2>/dev/null || true
+            # Keep adb on and never auto-revoke authorisations
+            $BB nsenter -t $PID -m /system/bin/settings put global adb_enabled 1 2>/dev/null || true
+            $BB nsenter -t $PID -m /system/bin/settings put global adb_allowed_connection_time 0 2>/dev/null || true
+            $BB nsenter -t $PID -m /system/bin/settings put global private_dns_mode off 2>/dev/null || true
             $BB nsenter -t $PID -m /system/bin/svc power stayon true
             $BB nsenter -t $PID -m /system/bin/settings put global stay_on_while_plugged_in 7
             $BB nsenter -t $PID -m /system/bin/settings put system screen_off_timeout 2147483647
