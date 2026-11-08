@@ -793,6 +793,36 @@ skip_setup() {
     echo "[UI Activator] device marked provisioned, setup wizard skipped"
 }
 
+# Status bar / shade size: the bar height is max(cutout safe inset, 24 dp).
+# The host's punch-hole cutout is ~139 px tall, i.e. ~41 dp at 540 dpi, so the
+# cutout - not the density - probably decides the bar height, while icons and
+# text follow the density. Which direction "off" means is not known yet, so
+# instead of guessing, record what the guest actually computes, once the UI
+# is up, to /data/local/tmp/lineage_display.txt (no personal data in it).
+display_report() {
+    sleep 20
+    out=/data/local/tmp/lineage_display.txt
+    {
+        echo "== $(date) density flag=$(flag density 540) font_scale flag=$(flag font_scale unset)"
+        echo "== wm"; gx /system/bin/wm size; gx /system/bin/wm density
+        echo "== settings"
+        for k in font_scale min_refresh_rate peak_refresh_rate; do
+            echo "system/$k=$(gx /system/bin/settings get system $k 2>/dev/null)"
+        done
+        echo "secure/display_cutout_mode=$(gx /system/bin/settings get secure display_cutout_mode 2>/dev/null)"
+        echo "== display cutout (dumpsys display)"
+        gx /system/bin/dumpsys display 2>/dev/null | grep -iE 'cutout|DisplayDeviceInfo\{' | head -n 20
+        echo "== window insets (dumpsys window)"
+        gx /system/bin/dumpsys window 2>/dev/null | grep -iE 'cutout|statusBars|InsetsSource|mStableInsets|StatusBar.*frame' | head -n 40
+        echo "== overlays"
+        gx /system/bin/cmd overlay list 2>/dev/null | grep -iE 'cutout|navbar|statusbar|android$' | head -n 30
+        echo "== guest cgroup v2 visible? (heat diagnosis)"
+        gx /system/bin/ls /sys/fs/cgroup 2>/dev/null | head -n 5 || echo "(empty)"
+    } > "$out" 2>&1
+    chmod 644 "$out" 2>/dev/null
+    echo "[UI Activator] display report written to $out"
+}
+
 early_tweaks() {
     [ "$WIZARD_DONE" = 1 ] || skip_setup
     if [ "$SAFETY_DONE" = 0 ]; then
@@ -850,6 +880,14 @@ while true; do
             LDENS=$(cat "$STAGE/density" 2>/dev/null | tr -dc '0-9')
             [ -n "$LDENS" ] || LDENS=540
             $BB nsenter -t $PID -m /system/bin/wm density "$LDENS" 2>/dev/null || true
+            # Text size independent of density (status bar clock, shade, apps).
+            # Unset by default. e.g. echo 0.9 > $STAGE/font_scale
+            LFS=$(flag font_scale "")
+            case "$LFS" in
+                ''|*[!0-9.]*) ;;
+                *) $BB nsenter -t $PID -m /system/bin/settings put system font_scale "$LFS" 2>/dev/null && \
+                       echo "[UI Activator] font_scale=$LFS" ;;
+            esac
             # GMS SafetyCenter crash loop: see early_tweaks above (retried here in
             # case the settings provider was not up during the early polls).
             early_tweaks
@@ -896,6 +934,7 @@ while true; do
             $BB nsenter -t $PID -m /system/bin/am unlock-user 0
             $BB nsenter -t $PID -m /system/bin/am start -a android.intent.action.MAIN -c android.intent.category.HOME
             echo '[UI Activator] Home activated!'
+            display_report &
             echo '[UI Activator] Creating missing app data dirs...'
             $BB nsenter -t $PID -m /system/bin/sh /data/local/tmp/fix_app_dirs.sh 2>/dev/null || true
 
