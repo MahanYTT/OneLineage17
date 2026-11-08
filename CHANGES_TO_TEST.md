@@ -1,0 +1,170 @@
+# Changes to test (cloud session, 2026-11-08)
+
+None of this has run on the phone yet. Every change below was written from
+reading the scripts. CI checks it offline: syntax under mksh/busybox/dash,
+shellcheck, LF line endings, zygote_exec integrity, and unit tests that run the
+watchdog logic against fake sysfs/props. CI says nothing about how the phone
+behaves. Each new behaviour can be switched off with a file in
+`/data/local/tmp/lineage_stage/` ("`$STAGE`" below). No APK rebuild is needed
+to switch one off.
+
+## 0. Getting the new scripts onto the phone
+
+**A. Fastest, no APK rebuild.** `switch_to_lineage.sh` only copies files from
+the app into `$STAGE` when they are missing there, so files you push yourself
+are kept:
+
+```bash
+adb push assets/switch_to_lineage.sh assets/return_to_oneui.sh assets/master_prepare.sh assets/master_inner.sh /data/local/tmp/
+```
+
+```bash
+adb shell su -c 'cp /data/local/tmp/switch_to_lineage.sh /data/local/tmp/return_to_oneui.sh /data/local/tmp/master_prepare.sh /data/local/tmp/master_inner.sh /data/local/tmp/lineage_stage/ && chmod 755 /data/local/tmp/lineage_stage/*.sh'
+```
+
+Then start Lineage from adb instead of the app's Switch button. Do not open
+the OneLineage app after pushing: when it starts, and again when you tap
+Switch, it copies its bundled (old) scripts over `$STAGE`.
+
+```bash
+adb shell su -c 'setsid sh /data/local/tmp/lineage_stage/switch_to_lineage.sh </dev/null >/data/local/tmp/lineage_stage/takeover_app.log 2>&1 &'
+```
+
+**B. The usual way.** Repack the APK with the four `.sh` files and sign it
+(see HANDOFF.md, "Build and test"). Git already checks the files out with LF
+line endings.
+
+Replace `su -c` with however you normally get a root shell.
+
+## 1. Thermal safety valve (test first, it protects the hardware)
+
+What: `thermal_guard.sh` watches the cpu/gpu thermal zones and the battery.
+85 C for 20 s: CPUs are capped to 70 %. 95 C for 30 s, 103 C for 6 s, or
+battery 47 C for 60 s: it runs `return_to_oneui.sh` by itself and posts a
+notification in One UI.
+
+Proof:
+```bash
+adb shell su -c 'sh /data/local/tmp/lineage_ctl.sh status'
+```
+`thermal_guard: running` should appear, plus the hottest zones. Then:
+```bash
+adb shell su -c 'cat /data/local/tmp/thermal_guard.log'
+```
+The first line lists the zones it chose (`zones: cpu-... gpuss-...`). If it
+says `WARNING: no thermal zone matched`, send me `lineage_ctl.sh temps` and
+set `thermal_zones` to a regex that matches.
+
+Safe trip test (no real heat needed): lower the trip point below the current
+temperature, then wait ~30 s. The phone should return to One UI by itself, and
+`$STAGE/thermal_tripped` and a notification should appear:
+```bash
+adb shell su -c 'sh /data/local/tmp/lineage_ctl.sh set thermal_trip_c 40'
+```
+That flag is only read when the guard starts (and again every ~30 s), so it
+takes effect without restarting. Afterwards set it back:
+```bash
+adb shell su -c 'sh /data/local/tmp/lineage_ctl.sh unset thermal_trip_c'
+```
+Off switch: `lineage_ctl.sh set thermal_guard 0`, or `log` for a dry run.
+
+## 2. Setup wizard skip
+
+What: marks the guest provisioned and disables the GMS/Lineage/AOSP setup
+wizards in the guest only, before HOME starts.
+
+Proof: Lineage boots straight to the launcher. Then:
+```bash
+adb shell su -c 'grep -E "wizard|provisioned|SafetyCenter" /data/local/tmp/ui_activator.log'
+```
+Expect `device marked provisioned, setup wizard skipped`.
+Undo: `lineage_ctl.sh wizard-restore`.
+
+## 3. Heat: what is burning CPU now
+
+These run together. The first proof is whether the phone is cooler. Check
+`lineage_ctl.sh status` (temps + top CPU users) 5 and 15 minutes after boot,
+and compare with the ~105 C from before.
+
+| Change | Proof | Off switch |
+|---|---|---|
+| GMS SafetyCenter disabled early, DeviceConfig sync frozen | `ui_activator.log` has `SafetyCenter API disabled for GMS`; `adb logcat -b crash -d \| grep -c "Unexpected safety source"` stops growing; `crashloop_guard.log` has no `GMS still hits SafetyCenter` | `gms_safety_fix 0` |
+| Crash-loop guard (disables looping non-core apps in the guest) | `lineage_ctl.sh logs` → `crashloop_guard.log`; `lineage_ctl.sh crashloop-list` | `crashloop_guard 0` / `log`; undo with `crashloop-undo` |
+| Storage sweep only on install (was ~1500 forks / 10 s) | `top` no longer shows a constant stream of `stat`; installing an app from Play still makes it launchable within ~10 s | `storage_sweep_full 1` |
+| Dexopt throttle (host props, restored on exit) | `adb shell getprop pm.dexopt.disable_bg_dexopt` = `true` while in Lineage and back to the old value after return; no `dex2oat` in `top` | `dexopt_throttle 0` |
+| Idle at 60 Hz instead of forced 120 Hz | `adb shell su -c 'cat /data/local/tmp/lineage_display.txt'` shows `min_refresh_rate=60.0` | `min_refresh 120.0` |
+| Guest cgroups + app freezer (**opt-in, off**) | Turn on only after the rest is confirmed: `lineage_ctl.sh set guest_cgroups 1`, Switch again, then the display report shows files under `/sys/fs/cgroup` | `guest_cgroups 0` |
+
+If it is still hot: run `lineage_ctl.sh status` while hot and send me the
+"top CPU users" part and the `thermal_guard.log` lines starting `top CPU users:`.
+The guard records them each time it reaches the soft limit.
+
+## 4. Wi-Fi / internet spinner (DNS heal)
+
+What: the old heal toggled Wi-Fi every 90 s, and every toggle created a new
+network with the same ~30 s DNS gap. The new one sets DNS for the current
+netId with `ndc` and never toggles Wi-Fi unless `net_bounce=1`.
+
+Proof:
+```bash
+adb shell su -c 'cat /data/local/tmp/lineage_stage/data/app_storage.log'
+```
+You may see `dns heal: netId N ... names resolve again`. You should not see
+repeated `wifi bounced` lines. Settings > Network should show Wi-Fi as
+connected without "no internet", and Play Store should load.
+If `still failing` repeats: `lineage_ctl.sh set dns_servers 1.1.1.1,8.8.8.8`.
+If that also fails, send me the `ndc:` part of those lines.
+Off: `dns_heal 0`. Old behaviour as last resort: `net_bounce 1`.
+
+## 5. ADB
+
+What: the watchdog checks every 1 s (was 3 s) and logs every USB state change.
+adb over Wi-Fi is opt-in.
+
+Proof: `cat /data/local/tmp/adb_watchdog.log` after a drop shows exactly
+when `usb.state` changed and what it was rewritten to.
+Wi-Fi fallback (needs a Switch after setting it):
+```bash
+adb shell su -c 'sh /data/local/tmp/lineage_ctl.sh set adb_tcp 5555'
+```
+After Lineage is up, `lineage_ctl.sh status` prints the `wlan0` address, then:
+```bash
+adb connect PHONE_IP:5555
+```
+It uses the PC's existing adb key, so no pairing is needed. `return_to_oneui.sh`
+restores the port setting.
+
+## 6. Status bar size: needs your eyes
+
+Nothing was changed blindly. Please send:
+1. a screenshot of Lineage's status bar with the shade pulled down, and
+   one of One UI for comparison;
+2. `adb shell su -c 'sh /data/local/tmp/lineage_ctl.sh display'`.
+
+Try these live while you are at it (no reboot):
+```bash
+adb shell su -c 'sh /data/local/tmp/lineage_ctl.sh density 500'
+```
+```bash
+adb shell su -c 'sh /data/local/tmp/lineage_ctl.sh fontscale 0.9'
+```
+The bar height probably follows the camera cutout (~139 px), not the density.
+If the bar is too tall, the next step is a cutout/status-bar-height overlay,
+and the report tells me which values to use.
+
+## 7. Repo hygiene
+
+- `.gitattributes`: `zygote_exec` is now `binary`. It was `text eol=lf`,
+  which allows end-of-line rewriting inside an ELF.
+- CI: `.github/workflows/scripts.yml` runs `tests/run_all.sh` on every push.
+  Run it locally with `sh tests/run_all.sh` (needs mksh, busybox, dash and
+  shellcheck).
+
+## All toggles
+
+`adb shell su -c 'sh /data/local/tmp/lineage_ctl.sh flags'` prints every
+toggle with its value and default. Most toggles are read at Switch time. The
+exceptions are the thermal guard thresholds (re-read every ~30 s), `dns_heal`,
+`dns_servers` and `net_bounce` (read every 10 s; `lineage_ctl.sh set` also
+updates the guest's copy), and `density`/`fontscale` through `lineage_ctl.sh`
+(applied immediately).

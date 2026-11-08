@@ -1,5 +1,27 @@
 # OneLineage17 hand-off: overheating, setup wizard hang, status bar size
 
+> **Update 2026-11-08 (cloud session, nothing tested on the device):** the patches for
+> all four problems are on `main`, one commit per problem, and each can be switched off
+> with a file in `/data/local/tmp/lineage_stage/`. **Start with
+> [CHANGES_TO_TEST.md](CHANGES_TO_TEST.md)**, which is ordered by risk and gives the exact
+> commands. `/data/local/tmp/lineage_ctl.sh` (written at Switch) shows status and flips
+> toggles. CI (`tests/run_all.sh`) checks syntax, line endings and the watchdog logic offline.
+> What changed from the plan below, and why:
+> - The `safety_center_is_enabled` flag is kept, not replaced. Android 16's
+>   `setSafetySourceData` checks "API enabled" *before* it validates the source id, so the
+>   flag should work. The old code just set it too late (~45 s in) and let GMS sync it back.
+> - Not done: freezing GMS components, or swapping in MindTheGapps' GMS. The first needs
+>   component names we don't have; the second is a downgrade that can break GMS databases.
+>   The crash-loop guard logs whether the SafetyCenter crash still happens.
+> - `persist.sys.usb.config` is left alone. AOSP UsbDeviceManager parses it at start and
+>   does not know Samsung's `sec_charging` function. adb over Wi-Fi (`adb_tcp`) is the fallback.
+> - Found by reading the scripts: `ensure_app_storage.sh` forked ~1500 `stat` every 10 s;
+>   `min_refresh_rate` was forced to 120 Hz; the DNS heal flushed a hard-coded netId 100,
+>   and its hostname-ping check misread networks that drop ICMP as broken DNS;
+>   `zygote_exec` was marked `text` in `.gitattributes`.
+> - Status bar: no resource change without a screenshot. A diagnostics report and live
+>   density/fontscale knobs were added instead.
+
 Repo: https://github.com/MahanYTT/OneLineage17 (fork of WeWaffles/OneLineage), branch `main`.
 Owner's own phone, own fork, own LineageOS image. Nothing here is third-party or untrusted.
 
