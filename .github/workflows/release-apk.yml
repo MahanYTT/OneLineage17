@@ -1,0 +1,97 @@
+name: build APK
+
+# Builds OneLineage.apk from main with build_apk.sh (the from-source route)
+# and publishes it as a GitHub Release, so the latest scripts can be installed
+# straight from the phone: https://github.com/MahanYTT/OneLineage17/releases/latest
+#
+# Signing: if the repository secret RELEASE_KEYSTORE_B64 (base64 of a .jks or
+# .keystore, alias androiddebugkey, password in RELEASE_KEYSTORE_PASS or
+# "android") is set, every build uses that key and installs as an update over
+# the previous CI build. Without it each build gets a throw-away key, and the
+# installed app has to be uninstalled before a new build can be installed
+# (the staged image in /data/local/tmp/lineage_stage is not affected).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'assets/**'
+      - 'src/**'
+      - 'res/**'
+      - 'AndroidManifest.xml'
+      - 'build_apk.sh'
+      - '.github/workflows/release-apk.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-apk
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the device scripts first
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mksh busybox dash shellcheck file
+          sh tests/run_all.sh
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android build-tools 34 and platform 34
+        run: |
+          SDK="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          echo "SDK=$SDK" >> "$GITHUB_ENV"
+          yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK" \
+            "build-tools;34.0.0" "platforms;android-34" > /dev/null
+
+      - name: Restore signing key (optional secret)
+        env:
+          KS_B64: ${{ secrets.RELEASE_KEYSTORE_B64 }}
+        run: |
+          mkdir -p keystore
+          if [ -n "$KS_B64" ]; then
+            echo "$KS_B64" | base64 -d > keystore/debug.keystore
+            echo "Using the RELEASE_KEYSTORE_B64 key"
+          else
+            echo "No RELEASE_KEYSTORE_B64 secret: build_apk.sh will create a throw-away key"
+          fi
+
+      - name: Build APK
+        env:
+          ANDROID_SDK_ROOT: ${{ env.SDK }}
+          KEYSTORE_PASS: ${{ secrets.RELEASE_KEYSTORE_PASS || 'android' }}
+        run: |
+          ./build_apk.sh
+          ls -l out/OneLineage.apk
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SHORT=$(git rev-parse --short HEAD)
+          TAG="build-${GITHUB_RUN_NUMBER}"
+          cp out/OneLineage.apk "OneLineage-${SHORT}.apk"
+          {
+            echo "Automatic build of main at ${SHORT}. **Untested on device.**"
+            echo
+            echo "What changed and how to test it: [CHANGES_TO_TEST.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/CHANGES_TO_TEST.md)"
+            echo
+            echo "Signed with a CI key, not your own uber-apk-signer key: uninstall the old OneLineage app before installing this one."
+            echo "The downloaded LineageOS image in /data/local/tmp/lineage_stage is kept."
+            echo
+            echo "Commits:"
+            git log -8 --format='- %h %s'
+          } > notes.md
+          gh release create "$TAG" "OneLineage-${SHORT}.apk" \
+            --target "$GITHUB_SHA" --title "OneLineage ${SHORT} (build ${GITHUB_RUN_NUMBER})" \
+            --notes-file notes.md --latest
