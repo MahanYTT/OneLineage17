@@ -343,6 +343,14 @@ while true; do
             echo "[UI Activator] Failsafe: system_server up for 45s, proceeding to activate UI..."
             is_ready=1
         fi
+    else
+        ready_count=$((ready_count + 1))
+        echo "[UI Activator] Waiting for system_server... (${ready_count} attempts)"
+        if [ "$ready_count" -ge 30 ]; then
+            echo "[UI Activator] ERROR: system_server never appeared after 60s!"
+            break
+        fi
+    fi
 
         if [ "$is_ready" = "1" ]; then
             echo '[UI Activator] WindowManager is ready! Dismissing bootanim and unlocking...'
