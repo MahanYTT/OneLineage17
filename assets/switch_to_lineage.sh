@@ -409,7 +409,6 @@ while true; do
             echo "[UI Activator] sm mount result: _sm_ok=$_sm_ok (attempts: $_attempt)"
             break
         fi
-    fi
 done
 UIACT
 chmod 755 /data/local/tmp/ui_activator.sh

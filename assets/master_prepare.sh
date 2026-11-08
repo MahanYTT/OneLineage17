@@ -652,6 +652,22 @@ mount_payload "healthfitness" "com.android.healthfitness"
 mount_payload "ondevicepersonalization" "com.android.ondevicepersonalization"
 mount_payload "configinfrastructure" "com.android.configinfrastructure"
 mount_payload "bt" "com.android.bt"
+mount_payload "conscrypt" "com.android.conscrypt"
+mount_payload "media" "com.android.media"
+mount_payload "media.swcodec" "com.android.media.swcodec"
+mount_payload "ipsec" "com.android.ipsec"
+mount_payload "devicelock" "com.android.devicelock"
+mount_payload "os.statsd" "com.android.os.statsd"
+mount_payload "profiling" "com.android.profiling"
+mount_payload "scheduling" "com.android.scheduling"
+mount_payload "telephonycore" "com.android.telephonycore"
+mount_payload "tzdata" "com.android.tzdata"
+mount_payload "uwb" "com.android.uwb"
+mount_payload "virt" "com.android.virt"
+mount_payload "neuralnetworks" "com.android.neuralnetworks"
+mount_payload "resolv" "com.android.resolv"
+mount_payload "uprobestats" "com.android.uprobestats"
+mount_payload "adbd" "com.android.adbd"
 
 # Payload extractions above used the GSI's own /system/apex files. Now that the
 # images are cached, present the HOST's /system/apex to the container so the
@@ -670,14 +686,9 @@ for a in /apex/*; do
         *samsung*)
             continue
             ;;
-        com.android.art*|com.android.i18n*|com.android.runtime*|com.android.sdkext*|\
-        com.android.nfcservices*|com.android.tethering*|com.android.crashrecovery*|\
-        com.android.cellbroadcast*|com.android.extservices*|com.android.permission*|\
-        com.android.wifi*|com.android.appsearch*|com.android.mediaprovider*|\
-        com.android.adservices*|com.android.rkpd*|com.android.healthfitness*|\
-        com.android.ondevicepersonalization*|com.android.configinfrastructure*|\
-        com.android.bt*)
-            # Never bind-mount host copies of payload APEXes!
+        com.android.*)
+            # All com.android.* APEXes from GSI are mounted via direct payload!
+            # Never bind-mount host copies of any com.android.* APEX!
             continue
             ;;
     esac
