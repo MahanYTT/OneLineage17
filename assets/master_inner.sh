@@ -121,9 +121,12 @@ rm -f /dev/socket/zygote /dev/socket/usap_pool_primary 2>/dev/null || true
 # from Lineage only: adbd keeps checking known keys itself, the framework just
 # gets "connection refused". This namespace is private (make-rprivate above),
 # so One UI's /dev/socket/adbd is untouched.
-# Off: echo 0 > /data/local/tmp/lineage_stage/adb_framework_block
+# Result on device: adb over USB still stalled ~100 s after boot with the
+# socket hidden, while adb over Wi-Fi kept working, so the stall is in the USB
+# path, not here. Kept as an experiment, OFF by default.
+# On: echo 1 > /data/local/tmp/lineage_stage/adb_framework_block
 case "$(cat /data/local/tmp/lineage_flags/adb_framework_block 2>/dev/null | tr -d ' \t\r\n')" in
-    0|off|false|no) echo "[Pivoted Root] adb framework socket left visible (flag)" ;;
+    ""|0|off|false|no) ;;
     *)
         if [ -S /dev/socket/adbd ] && $BB mount --bind /dev/null /dev/socket/adbd 2>/dev/null; then
             echo "[Pivoted Root] adbd control socket hidden from Lineage"

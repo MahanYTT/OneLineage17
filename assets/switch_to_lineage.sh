@@ -121,7 +121,8 @@ dns_servers|(network)|force resolvers, comma separated
 net_bounce|0|allow toggling Wi-Fi as a last-resort DNS fix
 density|540|guest display density (dpi)
 font_scale|(unset)|guest font scale, e.g. 0.9
-adb_framework_block|on|hide the adbd control socket from Lineage (adb hang)
+frro_fix|on|rebuild runtime-overlay idmaps for Lineage (cutout, theme colours)
+adb_framework_block|off|experiment: hide the adbd control socket from Lineage
 key_escape|on|hold Volume Up + Down 3 s to return to One UI
 cutout_fix|on|give the guest the One UI camera cutout (status bar position)
 adb_tcp|0|adb over Wi-Fi port (e.g. 5555), next Switch
@@ -1176,6 +1177,55 @@ apply_cutout() {
             echo "[UI Activator] disabled $ov"
     done
     echo "[UI Activator] cutout spec applied: $spec"
+    fix_frro_idmaps restart
+}
+
+# Runtime overlays (fabricated .frro: our cutout, SystemUI's wallpaper colours)
+# never applied in Lineage. Verified on an S26 Ultra: Lineage's system_server
+# reaches One UI's Android 17 idmap2d through the shared servicemanager, which
+# writes the .frro files and idmaps into One UI's /data/resource-cache in its
+# own format ("failed to parse idmap header"). Lineage never sees usable
+# copies, so `cmd overlay lookup` returned the GSI's empty cutout. Copy the
+# .frro files into Lineage's /data, build Lineage-format idmaps with Lineage's
+# own idmap2 (as master_inner.sh already does for the gesture-nav overlay),
+# re-enable the overlays and restart SystemUI so the status bar is laid out
+# again. Off: echo 0 > $STAGE/frro_fix
+fix_frro_idmaps() {
+    is_off "$(flag frro_fix on)" && return 0
+    gcache="$STAGE/data/resource-cache"
+    mkdir -p "$gcache"
+    n=0
+    for f in /data/resource-cache/*.frro; do
+        [ -f "$f" ] || continue
+        cp -f "$f" "$gcache/" 2>/dev/null && n=$((n + 1))
+    done
+    chown system:system "$gcache"/*.frro 2>/dev/null
+    chmod 644 "$gcache"/*.frro 2>/dev/null
+    ok=0; bad=0
+    for f in "$gcache"/*.frro; do
+        [ -f "$f" ] || continue
+        b=${f##*/}; gpath="/data/resource-cache/$b"
+        name=${b%.frro}; name=${name#*-}; name=${name%-*}
+        idm="/data/resource-cache/data@resource-cache@$b@idmap"
+        if gx /system/bin/idmap2 create --target-apk-path /system/framework/framework-res.apk \
+                --overlay-apk-path "$gpath" --overlay-name "$name" --idmap-path "$idm" \
+                --ignore-overlayable >/dev/null 2>&1; then
+            ok=$((ok + 1))
+        else
+            bad=$((bad + 1))
+        fi
+    done
+    chown system:system "$gcache"/*@idmap 2>/dev/null
+    chmod 644 "$gcache"/*@idmap 2>/dev/null
+    for ov in $(gx /system/bin/cmd overlay list android 2>/dev/null | grep -o '[^ ]*:ol_config_[A-Za-z]*'); do
+        gx /system/bin/cmd overlay disable "$ov" >/dev/null 2>&1
+        gx /system/bin/cmd overlay enable "$ov" >/dev/null 2>&1
+    done
+    echo "[UI Activator] frro: copied $n, idmaps ok=$ok failed=$bad"
+    if [ "$1" = restart ]; then
+        sp=$(gx /system/bin/pidof com.android.systemui 2>/dev/null)
+        [ -n "$sp" ] && kill $sp 2>/dev/null && echo "[UI Activator] SystemUI restarted to apply the cutout"
+    fi
 }
 
 # Status bar / shade size: the bar height is max(cutout safe inset, 24 dp).
@@ -1186,6 +1236,7 @@ apply_cutout() {
 # is up, to /data/local/tmp/lineage_display.txt (no personal data in it).
 display_report() {
     sleep 20
+    ( sleep 40; fix_frro_idmaps ) &
     out=/data/local/tmp/lineage_display.txt
     {
         echo "== $(date) density flag=$(flag density 540) font_scale flag=$(flag font_scale unset)"
