@@ -203,7 +203,11 @@ fi
 mkdir -p "$STAGE/data"
 APP_FILES="/data/user/0/com.wewaffles.onelineage/files"
 if [ -d "$APP_FILES" ]; then
-    cp -f "$APP_FILES"/* "$STAGE/" 2>/dev/null || true
+    for f in "$APP_FILES"/*; do
+        bf=$(basename "$f")
+        # Do not overwrite files in STAGE if already present
+        [ -f "$STAGE/$bf" ] || cp -f "$f" "$STAGE/$bf" 2>/dev/null || true
+    done
 fi
 chmod 755 "$STAGE"/*.sh "$STAGE/zygote_exec" 2>/dev/null || true
 
@@ -221,6 +225,7 @@ echo "=== [6/6] Launching LineageOS Takeover Daemon ==="
 pkill -f "while true; do [ \"\$(getprop init.svc.zygote)\"" 2>/dev/null || true
 pkill -f "while true; do for p in \\\$(pidof audioserver cameraserver)" 2>/dev/null || true
 setprop ctl.stop zygote
+setprop ctl.stop zygote_next 2>/dev/null || true
 setprop ctl.stop surfaceflinger
 # audioserver/cameraserver are deliberately left running. The guest shares this
 # binder namespace, and its AudioService.<init> -> AudioDeviceBroker.init ->
@@ -233,7 +238,7 @@ kill -9 $(pidof surfaceflinger) 2>/dev/null || true
 kill -9 $(pidof bootanimation) 2>/dev/null || true
 kill -9 $(pidof app_process64) 2>/dev/null || true
 kill -9 $(pidof zygote_exec) 2>/dev/null || true
-kill -9 $(pidof zygote64) 2>/dev/null || true
+kill -9 $(pidof zygote64) $(pidof zygote_next) 2>/dev/null || true
 kill -9 $(pidof system_server) 2>/dev/null || true
 sleep 1
 
@@ -297,7 +302,7 @@ kill -9 $(pidof wificond) 2>/dev/null || true
 sleep 1
 
 # Suppress the host zygote only, so Samsung init does not resurrect it
-nohup $BB sh -c "while true; do [ \"\$(getprop init.svc.zygote)\" = \"running\" ] && setprop ctl.stop zygote; sleep 1; done" </dev/null >/dev/null 2>&1 &
+nohup $BB sh -c "while true; do [ \"\$(getprop init.svc.zygote)\" = \"running\" ] && setprop ctl.stop zygote; [ \"\$(getprop init.svc.zygote_next)\" = \"running\" ] && setprop ctl.stop zygote_next; sleep 1; done" </dev/null >/dev/null 2>&1 &
 
 # Copy inner script and zygote_exec into container data partition
 cp -f "$STAGE/master_inner.sh" "$STAGE/data/master_inner.sh"
@@ -318,6 +323,7 @@ while true; do
     sleep 2
     PID=\$(pidof system_server | awk '{print \$1}')
     if [ -n \"\$PID\" ]; then
+        echo "[UI Activator] system_server PID=\$PID alive, checking WindowManager..." >> /data/local/tmp/ui_activator.log
         if $BB nsenter -t \$PID -m /system/bin/dumpsys window 2>/dev/null | grep -q 'mStatusBar'; then
             echo '[UI Activator] WindowManager is ready! Dismissing bootanim and unlocking...'
             setprop service.bootanim.exit 1

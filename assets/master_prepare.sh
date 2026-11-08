@@ -615,9 +615,20 @@ mount_payload() {
     echo "Direct mounted $NAME on $LOOP -> $DEST"
     for vdir in "$ROOTFS/apex/${TARGET}"@*; do
         if [ -d "$vdir" ]; then
-       $BB umount -l "$vdir" 2>/dev/null || true
-       $BB mount -t ext4 -o ro "$LOOP" "$vdir"
-       echo "Direct mounted $NAME on $LOOP -> $vdir"
+            $BB umount -l "$vdir" 2>/dev/null || true
+            $BB mount -t ext4 -o ro "$LOOP" "$vdir"
+            echo "Direct mounted $NAME on $LOOP -> $vdir"
+        fi
+    done
+    # Also discover and mount any versioned APEXes existing in host /apex
+    for hdir in /apex/${TARGET}@*; do
+        if [ -d "$hdir" ]; then
+            vbase=$(basename "$hdir")
+            vdest="$ROOTFS/apex/$vbase"
+            mkdir -p "$vdest"
+            $BB umount -l "$vdest" 2>/dev/null || true
+            $BB mount -t ext4 -o ro "$LOOP" "$vdest"
+            echo "Direct mounted $NAME on $LOOP -> $vdest (from host $vbase)"
         fi
     done
 }
@@ -657,8 +668,18 @@ for a in /apex/*; do
     base=$(basename "$a")
     case "$base" in
         *samsung*)
-       continue
-       ;;
+            continue
+            ;;
+        com.android.art*|com.android.i18n*|com.android.runtime*|com.android.sdkext*|\
+        com.android.nfcservices*|com.android.tethering*|com.android.crashrecovery*|\
+        com.android.cellbroadcast*|com.android.extservices*|com.android.permission*|\
+        com.android.wifi*|com.android.appsearch*|com.android.mediaprovider*|\
+        com.android.adservices*|com.android.rkpd*|com.android.healthfitness*|\
+        com.android.ondevicepersonalization*|com.android.configinfrastructure*|\
+        com.android.bt*)
+            # Never bind-mount host copies of payload APEXes!
+            continue
+            ;;
     esac
     # Skip if already mounted
     if ! mount | grep -q "$ROOTFS/apex/$base "; then

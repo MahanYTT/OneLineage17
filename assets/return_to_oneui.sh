@@ -18,6 +18,7 @@ pkill -9 -f "rescue_boot_suppress" 2>/dev/null || true
 pkill -9 -f "system_server" 2>/dev/null || true
 pkill -9 -f org.lineageos 2>/dev/null || true
 pkill -9 -x zygote64 2>/dev/null || true
+pkill -9 -x zygote_next 2>/dev/null || true
 kill -9 $(pidof surfaceflinger) 2>/dev/null || true
 
 # Put the host's own /data trees back FIRST: master_prepare.sh bridges the
@@ -83,6 +84,7 @@ setprop ctl.start vendor.biometrics.fingerprint.inscreen 2>/dev/null || true
 
 setprop ctl.start surfaceflinger
 setprop ctl.start zygote
+setprop ctl.start zygote_next 2>/dev/null || true
 setprop ctl.start audioserver
 setprop ctl.start cameraserver
 # switch_to_lineage.sh stops the host media codec stack (its IMediaCodecList AIDL
