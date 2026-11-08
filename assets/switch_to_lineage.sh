@@ -108,6 +108,242 @@ ADBW
     echo "adbd watchdog started (log: /data/local/tmp/adb_watchdog.log)"
 fi
 
+# --- THERMAL SAFETY VALVE (untested on device) ----------------------------
+# Evidence: during a Lineage session a CPU thermal zone read ~105 C, the
+# battery ~44 C, and adb dropped. The guest has no thermal HAL session of its
+# own; the Samsung kernel throttles by itself, but nothing stops a runaway load
+# (crash loops, JIT storms) from keeping the SoC pinned at its limit for hours.
+# This host-side watchdog protects the hardware:
+#   * soft stage: max(cpu/gpu zones) >= thermal_soft_c (85) for 20 s
+#       -> cap every cpufreq policy to thermal_softcap_pct (70 %) of its max,
+#          log the top CPU users; lifted again after 60 s below soft-10.
+#   * trip: >= thermal_trip_c (95) for thermal_trip_secs (30 s), or
+#           >= trip+8 for 6 s, or battery >= thermal_batt_c (47) for 60 s
+#       -> run return_to_oneui.sh automatically and leave a marker file
+#          $STAGE/thermal_tripped plus a One UI notification.
+# Log: /data/local/tmp/thermal_guard.log (capped, rotated at 256 KB).
+# Toggle: echo 0   > $STAGE/thermal_guard   (off)
+#         echo log > $STAGE/thermal_guard   (log only, never acts)
+# Tune:   echo 97 > $STAGE/thermal_trip_c ; echo 80 > $STAGE/thermal_softcap_pct
+#         echo 0  > $STAGE/thermal_softcap_pct   (never cap, only trip)
+# Zones:  echo 'cpu|gpu' > $STAGE/thermal_zones   (grep -E regex on zone type)
+# return_to_oneui.sh restores the original cpufreq limits if the guard dies.
+pkill -f "thermal_guard.sh" 2>/dev/null || true
+rm -f "$STAGE/thermal_tripped" 2>/dev/null || true
+TG_MODE=$(cat "$STAGE/thermal_guard" 2>/dev/null | tr -d ' \t\r\n')
+case "$TG_MODE" in
+    0|off|false|no|disable|disabled)
+        echo "thermal guard disabled by $STAGE/thermal_guard"
+        ;;
+    *)
+        cat > /data/local/tmp/thermal_guard.sh <<'THERMAL'
+#!/system/bin/sh
+# OneLineage thermal safety valve. Written by switch_to_lineage.sh; read the
+# comment block there for the evidence and the toggles. Every path can be
+# overridden from the environment so tests/ can run this against a fake sysfs.
+STAGE=${STAGE:-/data/local/tmp/lineage_stage}
+TZ_ROOT=${TZ_ROOT:-/sys/class/thermal}
+BATT_TEMP=${BATT_TEMP:-/sys/class/power_supply/battery/temp}
+CPUFREQ_ROOT=${CPUFREQ_ROOT:-/sys/devices/system/cpu/cpufreq}
+LOG=${THERMAL_LOG:-/data/local/tmp/thermal_guard.log}
+RETURN_SCRIPT=${RETURN_SCRIPT:-$STAGE/return_to_oneui.sh}
+CAP_SAVE=${CAP_SAVE:-$STAGE/thermal_cpufreq.saved}
+INTERVAL=${THERMAL_INTERVAL:-2}
+MAX_ITER=${THERMAL_MAX_ITER:-0}
+SH=${GUARD_SH:-/system/bin/sh}
+NOTIFY_DELAY=${THERMAL_NOTIFY_DELAY:-60}
+
+flag() {
+    _v=$(cat "$STAGE/$1" 2>/dev/null | tr -d ' \t\r\n')
+    if [ -n "$_v" ]; then echo "$_v"; else echo "$2"; fi
+}
+num() { case "$1" in ''|*[!0-9]*) echo "$2" ;; *) echo "$1" ;; esac; }
+log() { echo "$(date '+%m-%d %H:%M:%S') $*" >> "$LOG"; }
+
+load_config() {
+    MODE=$(flag thermal_guard on)
+    SOFT_C=$(num "$(flag thermal_soft_c 85)" 85)
+    CAP_PCT=$(num "$(flag thermal_softcap_pct 70)" 70)
+    TRIP_C=$(num "$(flag thermal_trip_c 95)" 95)
+    TRIP_S=$(num "$(flag thermal_trip_secs 30)" 30)
+    BATT_C=$(num "$(flag thermal_batt_c 47)" 47)
+    [ "$CAP_PCT" -gt 100 ] && CAP_PCT=100
+    [ "$CAP_PCT" -gt 0 ] && [ "$CAP_PCT" -lt 30 ] && CAP_PCT=30
+    EMERG_C=$((TRIP_C + 8))
+    step=${INTERVAL:-2}; [ "$step" -gt 0 ] 2>/dev/null || step=1
+    TRIP_N=$(( (TRIP_S + step - 1) / step ))
+    SOFT_N=$(( (20 + step - 1) / step ))
+    COOL_N=$(( (60 + step - 1) / step ))
+    EMERG_N=$(( (6 + step - 1) / step ))
+    BATT_N=$(( (60 + step - 1) / step ))
+}
+
+# Pick the zones once: their types never change, and reading only the chosen
+# temp files with the shell's builtin `read` keeps every sample fork-free.
+select_zones() {
+    ZONES=""
+    re=$(flag thermal_zones 'cpu|gpu|cpuss|gpuss|apc|nsp|aoss|ddr')
+    for z in "$TZ_ROOT"/thermal_zone*; do
+        [ -r "$z/temp" ] && [ -r "$z/type" ] || continue
+        read -r t < "$z/type" 2>/dev/null || continue
+        if echo "$t" | grep -qiE "$re"; then
+            ZONES="$ZONES $z"
+        fi
+    done
+}
+
+# Sets MAX_C/MAX_ZONE. Values are millidegrees on Qualcomm; anything that is
+# not a sane temperature (negative, > 150 C, read error) is ignored, so a
+# broken sensor cannot trip the guard.
+sample() {
+    MAX_C=-1; MAX_ZONE=""
+    for z in $ZONES; do
+        v=""
+        read -r v < "$z/temp" 2>/dev/null || continue
+        case "$v" in ''|*[!0-9]*) continue ;; esac
+        [ "$v" -ge 1000 ] && v=$((v / 1000))
+        [ "$v" -gt 150 ] && continue
+        if [ "$v" -gt "$MAX_C" ]; then MAX_C=$v; MAX_ZONE=$z; fi
+    done
+    BATT=-1
+    b=""
+    if read -r b < "$BATT_TEMP" 2>/dev/null; then
+        case "$b" in ''|*[!0-9]*) ;; *) BATT=$((b / 10)) ;; esac
+    fi
+}
+
+zone_name() { _t=""; [ -n "$1" ] && read -r _t < "$1/type" 2>/dev/null; echo "${_t:-none}"; }
+
+cap_cpus() {
+    [ "$CAP_PCT" -gt 0 ] || return 0
+    for p in "$CPUFREQ_ROOT"/policy*; do
+        [ -w "$p/scaling_max_freq" ] && [ -r "$p/cpuinfo_max_freq" ] || continue
+        read -r cur < "$p/scaling_max_freq" || continue
+        read -r hw < "$p/cpuinfo_max_freq" || continue
+        grep -q "^$p/scaling_max_freq " "$CAP_SAVE" 2>/dev/null || \
+            echo "$p/scaling_max_freq $cur" >> "$CAP_SAVE"
+        target=$((hw * CAP_PCT / 100))
+        best=""
+        if [ -r "$p/scaling_available_frequencies" ]; then
+            for f in $(cat "$p/scaling_available_frequencies"); do
+                case "$f" in ''|*[!0-9]*) continue ;; esac
+                if [ "$f" -le "$target" ] && { [ -z "$best" ] || [ "$f" -gt "$best" ]; }; then
+                    best=$f
+                fi
+            done
+        fi
+        [ -n "$best" ] || best=$target
+        echo "$best" > "$p/scaling_max_freq" 2>/dev/null
+        read -r now < "$p/scaling_max_freq"
+        log "cap $(basename "$p"): $cur -> $best (reads back $now)"
+    done
+}
+
+restore_cpus() {
+    [ -f "$CAP_SAVE" ] || return 0
+    while read -r f v; do
+        [ -n "$f" ] && [ -n "$v" ] && echo "$v" > "$f" 2>/dev/null
+    done < "$CAP_SAVE"
+    rm -f "$CAP_SAVE"
+    log "cpufreq limits restored"
+}
+
+top_snapshot() {
+    log "top CPU users:"
+    top -b -n 1 -m 12 2>/dev/null | sed 's/^/    /' >> "$LOG"
+}
+
+trip() {
+    log "TRIP: $1 -> returning to One UI"
+    top_snapshot
+    echo "$(date) $1" > "$STAGE/thermal_tripped"
+    restore_cpus
+    if [ -f "$RETURN_SCRIPT" ]; then
+        if command -v setsid >/dev/null 2>&1; then
+            setsid "$SH" "$RETURN_SCRIPT" </dev/null >"$STAGE/thermal_return.log" 2>&1 &
+        else
+            nohup "$SH" "$RETURN_SCRIPT" </dev/null >"$STAGE/thermal_return.log" 2>&1 &
+        fi
+        # Tell the user why Lineage vanished, once One UI's system_server is up.
+        # Run detached and without this script's name in its command line, so
+        # return_to_oneui.sh's pkill does not take it down.
+        msg="Lineage was stopped to protect the phone: $1"
+        nohup "$SH" -c "sleep $NOTIFY_DELAY; cmd notification post -S bigtext -t OneLineage onelineage_heat \"\$0\"" "$msg" </dev/null >/dev/null 2>&1 &
+    else
+        log "return script $RETURN_SCRIPT missing; capping CPUs to 50% instead"
+        CAP_PCT=50; cap_cpus
+    fi
+    exit 0
+}
+
+: >> "$LOG"
+load_config
+select_zones
+log "thermal guard start: mode=$MODE soft=${SOFT_C}C cap=${CAP_PCT}% trip=${TRIP_C}C/${TRIP_S}s emergency=${EMERG_C}C batt=${BATT_C}C zones:$(for z in $ZONES; do printf ' %s' "$(zone_name "$z")"; done)"
+[ -n "$ZONES" ] || log "WARNING: no thermal zone matched; only the battery is watched"
+
+hot=0; emerg=0; batt_hot=0; soft=0; cool=0; capped=0; i=0
+while true; do
+    i=$((i + 1))
+    if [ $((i % 15)) -eq 0 ]; then
+        load_config
+        case "$MODE" in 0|off|false|no|disable|disabled) restore_cpus; log "disabled via flag file, exiting"; exit 0 ;; esac
+    fi
+    sample
+    act=1
+    case "$MODE" in log|dry|dryrun|dry-run) act=0 ;; esac
+
+    if [ "$MAX_C" -ge "$TRIP_C" ]; then hot=$((hot + 1)); else hot=0; fi
+    if [ "$MAX_C" -ge "$EMERG_C" ]; then emerg=$((emerg + 1)); else emerg=0; fi
+    if [ "$BATT" -ge "$BATT_C" ]; then batt_hot=$((batt_hot + 1)); else batt_hot=0; fi
+    if [ "$MAX_C" -ge "$SOFT_C" ]; then soft=$((soft + 1)); cool=0; else soft=0; fi
+    if [ "$MAX_C" -lt $((SOFT_C - 10)) ]; then cool=$((cool + 1)); fi
+
+    reason=""
+    if [ "$emerg" -ge "$EMERG_N" ]; then
+        reason="$(zone_name "$MAX_ZONE") at ${MAX_C}C (>= ${EMERG_C}C for 6 s)"
+    elif [ "$hot" -ge "$TRIP_N" ]; then
+        reason="$(zone_name "$MAX_ZONE") at ${MAX_C}C (>= ${TRIP_C}C for ${TRIP_S} s)"
+    elif [ "$batt_hot" -ge "$BATT_N" ]; then
+        reason="battery at ${BATT}C (>= ${BATT_C}C for 60 s)"
+    fi
+    if [ -n "$reason" ]; then
+        if [ "$act" = 1 ]; then trip "$reason"; fi
+        log "would trip (log-only mode): $reason"
+        hot=0; emerg=0; batt_hot=0
+    fi
+
+    if [ "$soft" -ge "$SOFT_N" ] && [ "$capped" = 0 ]; then
+        log "soft limit: $(zone_name "$MAX_ZONE") at ${MAX_C}C for 20 s"
+        top_snapshot
+        if [ "$act" = 1 ]; then cap_cpus; capped=1; fi
+        soft=0
+    fi
+    if [ "$capped" = 1 ] && [ "$cool" -ge "$COOL_N" ]; then
+        log "cooled to ${MAX_C}C for 60 s, lifting cap"
+        restore_cpus; capped=0; cool=0
+    fi
+
+    if [ $((i % 15)) -eq 1 ]; then
+        log "max=${MAX_C}C ($(zone_name "$MAX_ZONE")) batt=${BATT}C capped=$capped"
+        if [ "$(wc -c < "$LOG" 2>/dev/null)" -gt 262144 ] 2>/dev/null; then
+            mv -f "$LOG" "$LOG.1"; : > "$LOG"
+        fi
+    fi
+    [ "$MAX_ITER" -gt 0 ] && [ "$i" -ge "$MAX_ITER" ] && exit 0
+    sleep "$INTERVAL"
+done
+THERMAL
+        chmod 755 /data/local/tmp/thermal_guard.sh
+        if command -v setsid >/dev/null 2>&1; then
+            setsid /system/bin/sh /data/local/tmp/thermal_guard.sh </dev/null >/dev/null 2>&1 &
+        else
+            nohup /system/bin/sh /data/local/tmp/thermal_guard.sh </dev/null >/dev/null 2>&1 &
+        fi
+        echo "thermal guard started (log: /data/local/tmp/thermal_guard.log)"
+        ;;
+esac
+
 # Start persistent logcat capture for takeover diagnostics
 pkill -f "takeover_logcat.log" 2>/dev/null || true
 rm -f /data/local/tmp/takeover_logcat.log 2>/dev/null || true

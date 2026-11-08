@@ -11,6 +11,16 @@ pkill -9 -f "zygote_exec" 2>/dev/null || true
 # system_server comes back, so it cannot fight init over sys.usb.config.
 pkill -9 -f "adb_watchdog.sh" 2>/dev/null || true
 pkill -9 -f "ims_watchdog.sh" 2>/dev/null || true
+# Thermal safety valve (switch_to_lineage.sh). If it capped the CPUs and was
+# then killed, put the original cpufreq limits back so One UI is not left slow.
+pkill -9 -f "thermal_guard.sh" 2>/dev/null || true
+if [ -f /data/local/tmp/lineage_stage/thermal_cpufreq.saved ]; then
+    while read -r f v; do
+        [ -n "$f" ] && [ -n "$v" ] && echo "$v" > "$f" 2>/dev/null
+    done < /data/local/tmp/lineage_stage/thermal_cpufreq.saved
+    rm -f /data/local/tmp/lineage_stage/thermal_cpufreq.saved
+    echo "Restored cpufreq limits capped by the thermal guard"
+fi
 # Stop the suppressors started by switch_to_lineage.sh so One UI's own
 # media.codec and rescue_boot_count handling is restored.
 pkill -9 -f "media_codec_suppress" 2>/dev/null || true
