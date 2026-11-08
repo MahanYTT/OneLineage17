@@ -2,7 +2,7 @@ name: build APK
 
 # Builds OneLineage.apk from main with build_apk.sh (the from-source route)
 # and publishes it as a GitHub Release, so the latest scripts can be installed
-# straight from the phone: https://github.com/MahanYTT/OneLineage17/releases/latest
+# straight from a phone: https://github.com/MahanYTT/OneLineage17/releases/latest
 #
 # Signing: if the repository secret RELEASE_KEYSTORE_B64 (base64 of a .jks or
 # .keystore, alias androiddebugkey, password in RELEASE_KEYSTORE_PASS or
@@ -35,6 +35,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 20
 
       - name: Check the device scripts first
         run: |
@@ -82,15 +84,16 @@ jobs:
           TAG="build-${GITHUB_RUN_NUMBER}"
           cp out/OneLineage.apk "OneLineage-${SHORT}.apk"
           {
-            echo "Automatic build of main at ${SHORT}. **Untested on device.**"
+            echo "Automatic build of \`main\` at ${SHORT}. **Experimental and not tested on a device.** It needs root and replaces the running Android userspace, so only install it if you know how to recover your phone."
             echo
-            echo "What changed and how to test it: [CHANGES_TO_TEST.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/CHANGES_TO_TEST.md)"
+            echo "**Installing:** this build is signed with a CI key. If OneLineage is already installed from another build, uninstall it first, or Android will refuse with \"App not installed\" / \"Couldn't install\". A LineageOS image already downloaded to \`/data/local/tmp/lineage_stage\` is kept."
             echo
-            echo "Signed with a CI key, not your own uber-apk-signer key: uninstall the old OneLineage app before installing this one."
-            echo "The downloaded LineageOS image in /data/local/tmp/lineage_stage is kept."
+            echo "What changed and how to check it: [CHANGES_TO_TEST.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/CHANGES_TO_TEST.md)"
             echo
-            echo "Commits:"
+            echo "Recent commits:"
             git log -8 --format='- %h %s'
+            echo
+            echo "SHA-256: \`$(sha256sum "OneLineage-${SHORT}.apk" | cut -d' ' -f1)\`"
           } > notes.md
           gh release create "$TAG" "OneLineage-${SHORT}.apk" \
             --target "$GITHUB_SHA" --title "OneLineage ${SHORT} (build ${GITHUB_RUN_NUMBER})" \

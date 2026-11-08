@@ -1,6 +1,8 @@
-# Changes to test (cloud session, 2026-11-08)
+# Changes to test (2026-11-08)
 
-None of this has run on the phone yet. Every change below was written from
+Written for the OneLineage17 fork running on a Galaxy S26 Ultra (One UI 9 /
+Android 17), but most of it applies to any device OneLineage supports.
+None of this has run on a phone yet. Every change below was written from
 reading the scripts. CI checks it offline: syntax under mksh/busybox/dash,
 shellcheck, LF line endings, zygote_exec integrity, and unit tests that run the
 watchdog logic against fake sysfs/props. CI says nothing about how the phone
@@ -30,9 +32,11 @@ Switch, it copies its bundled (old) scripts over `$STAGE`.
 adb shell su -c 'setsid sh /data/local/tmp/lineage_stage/switch_to_lineage.sh </dev/null >/data/local/tmp/lineage_stage/takeover_app.log 2>&1 &'
 ```
 
-**B. The usual way.** Repack the APK with the four `.sh` files and sign it
-(see HANDOFF.md, "Build and test"). Git already checks the files out with LF
-line endings.
+**B. Download a build.** Every push to `main` publishes an APK at
+<https://github.com/MahanYTT/OneLineage17/releases/latest>. It is signed with a
+CI key, so uninstall any other OneLineage build first, or the installer fails
+with "Couldn't install". Or repack the APK yourself with the four `.sh` files
+(see HANDOFF.md, "Build and test"); git checks them out with LF line endings.
 
 Replace `su -c` with however you normally get a root shell.
 
@@ -52,8 +56,8 @@ adb shell su -c 'sh /data/local/tmp/lineage_ctl.sh status'
 adb shell su -c 'cat /data/local/tmp/thermal_guard.log'
 ```
 The first line lists the zones it chose (`zones: cpu-... gpuss-...`). If it
-says `WARNING: no thermal zone matched`, send me `lineage_ctl.sh temps` and
-set `thermal_zones` to a regex that matches.
+says `WARNING: no thermal zone matched`, check `lineage_ctl.sh temps` and
+set `thermal_zones` to a regex that matches your zone names.
 
 Safe trip test (no real heat needed): lower the trip point below the current
 temperature, then wait ~30 s. The phone should return to One UI by itself, and
@@ -95,8 +99,9 @@ and compare with the ~105 C from before.
 | Idle at 60 Hz instead of forced 120 Hz | `adb shell su -c 'cat /data/local/tmp/lineage_display.txt'` shows `min_refresh_rate=60.0` | `min_refresh 120.0` |
 | Guest cgroups + app freezer (**opt-in, off**) | Turn on only after the rest is confirmed: `lineage_ctl.sh set guest_cgroups 1`, Switch again, then the display report shows files under `/sys/fs/cgroup` | `guest_cgroups 0` |
 
-If it is still hot: run `lineage_ctl.sh status` while hot and send me the
-"top CPU users" part and the `thermal_guard.log` lines starting `top CPU users:`.
+If it is still hot: run `lineage_ctl.sh status` while hot. The "top CPU
+users" part, and the `thermal_guard.log` lines starting `top CPU users:`,
+show what to go after next (include them when opening an issue).
 The guard records them each time it reaches the soft limit.
 
 ## 4. Wi-Fi / internet spinner (DNS heal)
@@ -113,7 +118,7 @@ You may see `dns heal: netId N ... names resolve again`. You should not see
 repeated `wifi bounced` lines. Settings > Network should show Wi-Fi as
 connected without "no internet", and Play Store should load.
 If `still failing` repeats: `lineage_ctl.sh set dns_servers 1.1.1.1,8.8.8.8`.
-If that also fails, send me the `ndc:` part of those lines.
+If that also fails, the `ndc:` part of those lines shows what netd answered.
 Off: `dns_heal 0`. Old behaviour as last resort: `net_bounce 1`.
 
 ## 5. ADB
@@ -136,10 +141,10 @@ restores the port setting.
 
 ## 6. Status bar size: needs your eyes
 
-Nothing was changed blindly. Please send:
+Nothing was changed blindly. What is needed to fix it properly:
 1. a screenshot of Lineage's status bar with the shade pulled down, and
    one of One UI for comparison;
-2. `adb shell su -c 'sh /data/local/tmp/lineage_ctl.sh display'`.
+2. the output of `adb shell su -c 'sh /data/local/tmp/lineage_ctl.sh display'`.
 
 Try these live while you are at it (no reboot):
 ```bash
@@ -150,7 +155,7 @@ adb shell su -c 'sh /data/local/tmp/lineage_ctl.sh fontscale 0.9'
 ```
 The bar height probably follows the camera cutout (~139 px), not the density.
 If the bar is too tall, the next step is a cutout/status-bar-height overlay,
-and the report tells me which values to use.
+and the report gives the values to use.
 
 ## 7. Repo hygiene
 
