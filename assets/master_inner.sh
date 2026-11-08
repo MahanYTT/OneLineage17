@@ -88,8 +88,19 @@ sleep 1
 case "$(cat /data/local/tmp/lineage_flags/guest_mediaserver 2>/dev/null | tr -d ' \t\r\n')" in
     0|off|false|no) echo "[Pivoted Root] guest mediaserver disabled (flag)" ;;
     *)
-        /system/bin/mediaserver > /data/mediaserver.log 2>&1 &
-        echo "[Pivoted Root] mediaserver PID: $!" ;;
+        # The GSI ships mediaserver64/mediaserver32, not a plain mediaserver
+        # (verified: "/system/bin/mediaserver: not found" left media.player
+        # missing, so ringtones, settings sounds and video all failed).
+        MS=""
+        for b in /system/bin/mediaserver64 /system/bin/mediaserver /system/bin/mediaserver32; do
+            [ -x "$b" ] && { MS=$b; break; }
+        done
+        if [ -n "$MS" ]; then
+            $MS > /data/mediaserver.log 2>&1 &
+            echo "[Pivoted Root] $MS PID: $!"
+        else
+            echo "[Pivoted Root] WARNING: no mediaserver binary in the GSI"
+        fi ;;
 esac
 
 # Overlay idmaps. idmap2 refuses the GSI's product overlays because framework-res
