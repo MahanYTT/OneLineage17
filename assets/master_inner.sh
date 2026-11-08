@@ -82,6 +82,16 @@ WIFICOND_PID=$!
 echo "[Pivoted Root] wificond PID: $WIFICOND_PID"
 sleep 1
 
+# Lineage's own mediaserver (see "mediaserver" in switch_to_lineage.sh): serves
+# media.player and the codec list in Lineage's format, so SystemUI and
+# system_server stop looping (and leaking) on One UI's.
+case "$(cat /data/local/tmp/lineage_flags/guest_mediaserver 2>/dev/null | tr -d ' \t\r\n')" in
+    0|off|false|no) echo "[Pivoted Root] guest mediaserver disabled (flag)" ;;
+    *)
+        /system/bin/mediaserver > /data/mediaserver.log 2>&1 &
+        echo "[Pivoted Root] mediaserver PID: $!" ;;
+esac
+
 # Overlay idmaps. idmap2 refuses the GSI's product overlays because framework-res
 # does not declare the targeted resources as overlayable, so OMS ends up with no
 # idmap at all and silently ignores every overlay: gesture navigation never

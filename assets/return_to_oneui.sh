@@ -113,6 +113,9 @@ setprop ctl.start cameraserver
 # switch_to_lineage.sh stops the host media codec stack (its IMediaCodecList AIDL
 # hash does not match the GSI's, which spins the guest's MediaCodecList); bring it
 # back for One UI.
+# Lineage's own mediaserver (started by master_inner.sh) must go before One
+# UI's "media" service can register media.player again.
+kill -9 $(pidof mediaserver) 2>/dev/null || true
 for svc in media media.extractor media.codec media.metrics wificond; do
     setprop ctl.start $svc 2>/dev/null || true
 done

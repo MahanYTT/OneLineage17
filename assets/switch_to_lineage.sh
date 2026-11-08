@@ -121,6 +121,7 @@ dns_servers|(network)|force resolvers, comma separated
 net_bounce|0|allow toggling Wi-Fi as a last-resort DNS fix
 density|540|guest display density (dpi)
 font_scale|(unset)|guest font scale, e.g. 0.9
+guest_mediaserver|on|run the Lineage mediaserver instead of the One UI one
 frro_fix|on|rebuild runtime-overlay idmaps for Lineage (cutout, theme colours)
 adb_framework_block|off|experiment: hide the adbd control socket from Lineage
 key_escape|on|hold Volume Up + Down 3 s to return to One UI
@@ -1074,6 +1075,26 @@ fi
 setprop ctl.stop wificond 2>/dev/null || true
 kill -9 $(pidof wificond) 2>/dev/null || true
 sleep 1
+
+# mediaserver. Verified on an S26 Ultra (One UI 9): with only media.codec down,
+# Lineage still gets its codec list from One UI's mediaserver ("media.player",
+# Android 17). SystemUI and system_server sit in
+#   MediaCodec::CreateByType -> MediaCodecList::findMatchingCodecs ->
+#   BpMediaCodecList::getCodecInfo -> MediaCodecInfo::FromParcel
+# in a loop, mediaserver's binder threads burn ~120 % CPU, and both clients
+# grow ~100 MB of native heap per minute until they abort with "Scudo ERROR:
+# internal map failure (Out of memory)" after ~30 min (the freezes). Stop One
+# UI's mediaserver (init service "media") and let master_inner.sh start the
+# GSI's own, which serves the codec list in Lineage's format.
+# return_to_oneui.sh kills the guest copy and starts "media" again.
+# Off: echo 0 > $STAGE/guest_mediaserver
+if is_off "$(flag guest_mediaserver on)"; then
+    echo "guest mediaserver disabled, keeping One UI's"
+else
+    setprop ctl.stop media 2>/dev/null || true
+    kill -9 $(pidof mediaserver) 2>/dev/null || true
+    echo "One UI mediaserver stopped (Lineage starts its own)"
+fi
 
 # Suppress the host zygote only, so Samsung init does not resurrect it
 nohup $BB sh -c "while true; do [ \"\$(getprop init.svc.zygote)\" = \"running\" ] && setprop ctl.stop zygote; [ \"\$(getprop init.svc.zygote_next)\" = \"running\" ] && setprop ctl.stop zygote_next; sleep 1; done" </dev/null >/dev/null 2>&1 &
