@@ -79,6 +79,23 @@ while [ "$ims_i" -lt 45 ]; do
 done
 echo "IMS gate: voiceRegState=$ims_st after $((ims_i * 2))s, imsd=${ims_pid:-$(pidof imsd)}"
 
+# --- ADB OVER WI-FI FALLBACK (opt-in, untested on device) -----------------
+# USB adb was lost twice shortly after Lineage came up. adbd also listens on
+# TCP when service.adb.tcp.port is set (what `adb tcpip 5555` does), and it
+# authenticates with the same /data/misc/adb/adb_keys, so the PC that is
+# already authorised can connect over Wi-Fi without any pairing:
+#   echo 5555 > /data/local/tmp/lineage_stage/adb_tcp     (before Switch)
+#   adb connect <phone-ip>:5555      (lineage_ctl.sh status prints the IP)
+# adbd is restarted once here (a ~1 s USB blip). The original property is
+# restored by return_to_oneui.sh. Anyone on the same network can reach the
+# port, but cannot get in without an authorised key.
+ADB_TCP=$(flag adb_tcp 0 | tr -dc '0-9')
+if [ -n "$ADB_TCP" ] && [ "$ADB_TCP" -gt 0 ]; then
+    save_set_prop service.adb.tcp.port "$ADB_TCP"
+    setprop ctl.restart adbd 2>/dev/null || true
+    echo "adb over Wi-Fi enabled on port $ADB_TCP"
+fi
+
 # --- ADB WATCHDOG ---------------------------------------------------------
 # adb is the only way into the phone while Lineage is up (until wifi is
 # configured), and the host adbd occasionally dies or loses the adb function
@@ -90,33 +107,74 @@ pkill -f "adb_watchdog.sh" 2>/dev/null || true
 if ! ps -ef 2>/dev/null | grep -v grep | grep -q "adb_watchdog.sh"; then
     cat > /data/local/tmp/adb_watchdog.sh <<'ADBW'
 #!/system/bin/sh
-LOG=/data/local/tmp/adb_watchdog.log
+# Keeps the host adbd and the adb USB function alive (untested on device in
+# this revision). Changes vs. the first version, after adb was lost twice
+# shortly after Lineage came up:
+#   * polls every adb_watchdog_interval seconds (default 1, was 3), so a
+#     rewrite of sys.usb.config is undone before the host drops the gadget
+#     for long; three getprop calls per second cost next to nothing;
+#   * logs every change of sys.usb.state, so a drop is visible afterwards;
+#   * counts how often it had to fight the guest's UsbDeviceManager and
+#     says so if that happens more than 10 times a minute;
+#   * re-asserts service.adb.tcp.port when the opt-in Wi-Fi fallback
+#     (adb_tcp, see switch_to_lineage.sh) is on.
+STAGE=${STAGE:-/data/local/tmp/lineage_stage}
+LOG=${ADBW_LOG:-/data/local/tmp/adb_watchdog.log}
+MAX_ITER=${ADBW_MAX_ITER:-0}
+iv=$(cat "$STAGE/adb_watchdog_interval" 2>/dev/null | tr -dc '0-9')
+[ -n "$iv" ] && [ "$iv" -gt 0 ] || iv=1
+tcp=$(cat "$STAGE/adb_tcp" 2>/dev/null | tr -dc '0-9')
+log() { echo "$(date) $*" >> "$LOG"; }
+last_state=""
+fights=0
+win_start=$(date +%s)
+i=0
 while true; do
-    sleep 3
+    sleep "$iv"
+    i=$((i + 1))
     st=$(getprop init.svc.adbd)
     usb=$(getprop sys.usb.state)
     cfg=$(getprop sys.usb.config)
+    if [ "$usb" != "$last_state" ]; then
+        log "usb.state: '${last_state}' -> '${usb}' (config=$cfg, adbd=$st)"
+        last_state=$usb
+    fi
+    fixed=1
     case "$cfg" in
         adb)
             # Lineage's UsbDeviceManager rewrites the config to bare "adb", which
             # Samsung's init does not know: the gadget drops and adb disappears.
             setprop sys.usb.config sec_charging,adb 2>/dev/null
-            echo "$(date) bare adb -> sec_charging,adb" >> "$LOG"
+            log "bare adb -> sec_charging,adb"
             ;;
-        *adb*) ;;
+        *adb*) fixed=0 ;;
         ""|none)
             setprop sys.usb.config sec_charging,adb 2>/dev/null
-            echo "$(date) restored sec_charging,adb (was: $cfg)" >> "$LOG"
+            log "restored sec_charging,adb (was: $cfg)"
             ;;
         *)
             setprop sys.usb.config "$cfg,adb" 2>/dev/null
-            echo "$(date) added adb to usb.config (was: $cfg)" >> "$LOG"
+            log "added adb to usb.config (was: $cfg)"
             ;;
     esac
+    if [ "$fixed" = 1 ]; then
+        fights=$((fights + 1))
+        now=$(date +%s)
+        if [ $((now - win_start)) -ge 60 ]; then
+            [ "$fights" -gt 10 ] && log "WARNING: rewrote usb.config $fights times in $((now - win_start)) s; the guest keeps resetting it"
+            fights=0; win_start=$now
+        fi
+    fi
+    if [ -n "$tcp" ] && [ "$(getprop service.adb.tcp.port)" != "$tcp" ]; then
+        setprop service.adb.tcp.port "$tcp" 2>/dev/null
+        setprop ctl.restart adbd 2>/dev/null
+        log "re-asserted adb tcp port $tcp"
+    fi
     if [ "$st" != "running" ]; then
         setprop ctl.start adbd 2>/dev/null
-        echo "$(date) restarted adbd (was: $st, usb.state=$usb, usb.config=$cfg)" >> "$LOG"
+        log "restarted adbd (was: $st, usb.state=$usb, usb.config=$cfg)"
     fi
+    [ "$MAX_ITER" -gt 0 ] && [ "$i" -ge "$MAX_ITER" ] && exit 0
 done
 ADBW
     chmod 755 /data/local/tmp/adb_watchdog.sh
