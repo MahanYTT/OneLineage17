@@ -529,28 +529,93 @@ if [ -z "$iface" ]; then
     done
 fi
 [ -z "$iface" ] && exit 0
-# --- DNS self-heal ---------------------------------------------------------
-# After boot and after every wifi reconnect the guest resolver can sit on a
-# netId the host netd does not know: apps get "Unable to resolve host" /
-# ENONET even though IP connectivity works (observed: fails ~30 s, then fixes
-# itself, then breaks again on the next network re-creation). If raw IP works
-# but names do not, flush the resolver cache and bounce wifi, at most once per
-# 90 s.
-if ping -c1 -W2 1.1.1.1 >/dev/null 2>&1 || ping -c1 -W2 8.8.8.8 >/dev/null 2>&1; then
-    if ! ping -c1 -W3 connectivitycheck.gstatic.com >/dev/null 2>&1; then
+# --- DNS self-heal (rewritten, untested on device) ---------------------------
+# Evidence: right after boot and after every Wi-Fi network re-creation
+# (netId 100 -> 104 ...) the guest's NetworkMonitor reports
+# PROBE_DNS ... ENONET, apps get "Unable to resolve host", and it recovers by
+# itself after ~30 s. ENONET from the resolver means the netId has no DNS
+# configuration yet: the guest's ConnectivityService (Android 16) configures
+# the host's netd/DnsResolver (Android 17) late or not at all.
+# The old heal toggled Wi-Fi off/on (at most every 90 s). Every toggle creates
+# a NEW network id with the same unconfigured-resolver gap, so validation (and
+# the setup wizard's "checking connection" spinner) could restart forever.
+# It also tested DNS with `ping <hostname>`, which fails on networks that drop
+# ICMP even when DNS works.
+# Now: tell resolution failures apart from missing ICMP replies; when names
+# fail but IP works, configure DNS for the CURRENT default netId directly
+# (ndc resolver setnetdns + flushnet, and re-assert the default network),
+# using the network's own DNS servers from `dumpsys connectivity`, else the
+# gateway, else 1.1.1.1/8.8.8.8. Wi-Fi is only bounced if explicitly enabled,
+# with exponential backoff and at most 4 times per session.
+# Toggles (in $STAGE, mirrored into the guest's lineage_flags):
+#   echo 0 > dns_heal                     (no DNS repair at all)
+#   echo 1.1.1.1,9.9.9.9 > dns_servers    (force these resolvers)
+#   echo 1 > net_bounce                   (allow the old Wi-Fi toggle as a last resort)
+FLAGS=${LINEAGE_FLAGS:-/data/local/tmp/lineage_flags}
+NSTATE=${NET_STATE_DIR:-/data}
+gflag() {
+    _v=$(cat "$FLAGS/$1" 2>/dev/null | tr -d ' \t\r\n')
+    if [ -n "$_v" ]; then echo "$_v"; else echo "$2"; fi
+}
+# 0 = a name resolved (whether or not the host answers ICMP), 1 = it did not.
+dns_ok() {
+    _out=$(ping -c1 -W2 connectivitycheck.gstatic.com 2>&1); _rc=$?
+    [ "$_rc" -eq 0 ] && return 0
+    case "$_out" in
+        *"unknown host"*|*"bad address"*|*"resolve"*|*"Name or service"*|*"No address"*|*"Temporary failure"*) return 1 ;;
+    esac
+    # iputils ping: 1 = resolved but no reply, 2 = any other error
+    [ "$_rc" -eq 1 ] && return 0
+    return 1
+}
+ip_ok() { ping -c1 -W2 1.1.1.1 >/dev/null 2>&1 || ping -c1 -W2 8.8.8.8 >/dev/null 2>&1; }
+case "$(gflag dns_heal on)" in
+    0|off|false|no|disable|disabled) ;;
+    *)
+    if ip_ok && ! dns_ok; then
         now=$(date +%s)
-        last=$(cat /data/net_dns_fix.ts 2>/dev/null)
-        if [ -z "$last" ] || [ $((now - last)) -ge 90 ]; then
-            echo "$now" > /data/net_dns_fix.ts
-            ndc resolver flushdefaultif >/dev/null 2>&1
-            ndc resolver flushnet 100 >/dev/null 2>&1
-            case "$iface" in
-                wlan*) svc wifi disable >/dev/null 2>&1; sleep 2; svc wifi enable >/dev/null 2>&1 ;;
+        last=$(cat "$NSTATE/net_dns_fix.ts" 2>/dev/null)
+        if [ -z "$last" ] || [ $((now - last)) -ge 20 ]; then
+            echo "$now" > "$NSTATE/net_dns_fix.ts"
+            dump=$(dumpsys connectivity 2>/dev/null)
+            netid=$(echo "$dump" | sed -n 's/.*Active default network: *\([0-9][0-9]*\).*/\1/p' | head -n 1)
+            if [ -n "$netid" ]; then
+                servers=$(gflag dns_servers "" | tr ',' ' ')
+                if [ -z "$servers" ]; then
+                    servers=$(echo "$dump" | grep -m 1 "network{$netid}" \
+                        | sed -n 's/.*DnsAddresses: *\[\([^]]*\)\].*/\1/p' | tr ', ' '\n\n' \
+                        | sed 's#^/##' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 2 | tr '\n' ' ')
+                fi
+                [ -n "$servers" ] || servers="1.1.1.1 8.8.8.8"
+                ndc network default set "$netid" >/dev/null 2>&1
+                # shellcheck disable=SC2086
+                r=$(ndc resolver setnetdns "$netid" "" $servers 2>&1 | tr '\n' ' ')
+                ndc resolver flushnet "$netid" >/dev/null 2>&1
+                if dns_ok; then res="names resolve again"; else res="still failing"; fi
+                echo "dns heal: netId $netid on $iface -> dns $servers (ndc: ${r:-ok}); $res"
+            else
+                echo "dns heal: names fail with IP up on $iface, but no default network in dumpsys"
+            fi
+            case "$(gflag net_bounce 0)" in
+                1|on|true|yes)
+                    if ! dns_ok; then
+                        tries=$(cat "$NSTATE/net_bounce.count" 2>/dev/null | tr -dc '0-9'); tries=${tries:-0}
+                        lastb=$(cat "$NSTATE/net_bounce.ts" 2>/dev/null | tr -dc '0-9'); lastb=${lastb:-0}
+                        wait_s=$((90 << tries))
+                        if [ "$tries" -lt 4 ] && [ $((now - lastb)) -ge "$wait_s" ]; then
+                            case "$iface" in
+                                wlan*)
+                                    echo $((tries + 1)) > "$NSTATE/net_bounce.count"
+                                    echo "$now" > "$NSTATE/net_bounce.ts"
+                                    svc wifi disable >/dev/null 2>&1; sleep 2; svc wifi enable >/dev/null 2>&1
+                                    echo "dns heal: wifi bounced (attempt $((tries + 1))/4, net_bounce=1)" ;;
+                            esac
+                        fi
+                    fi ;;
             esac
-            echo "dns self-heal: names failed with IP up on $iface, resolver flushed"
         fi
-    fi
-fi
+    fi ;;
+esac
 subnet=$(ip route show table all 2>/dev/null | awk -v d="$iface" \
     '$2=="dev" && $3==d && $0 ~ /scope link/ && $1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\// {print $1; exit}')
 [ -z "$subnet" ] && exit 0
@@ -574,6 +639,8 @@ fi
 exit 0
 NETFIX
 chmod 755 "$STAGE/data/local/tmp/net_fix.sh" 2>/dev/null || true
+# Optional Wi-Fi bounce budget (net_bounce=1) is per session.
+rm -f "$STAGE/data/net_bounce.count" "$STAGE/data/net_bounce.ts" 2>/dev/null || true
 
 cat > "$STAGE/data/local/tmp/app_storage_loop.sh" <<'APPLOOP'
 #!/system/bin/sh

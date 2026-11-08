@@ -769,7 +769,32 @@ gx() { $BB nsenter -t "$PID" -m "$@"; }
 # DeviceConfig sync so GMS cannot undo it, and read it back.
 # Toggle: echo 0 > $STAGE/gms_safety_fix
 SAFETY_DONE=0
+#
+# Setup wizard: after Wi-Fi was joined inside the wizard it sat on "checking
+# for updates" / internet forever (it waits on GMS, which is crash-looping, and
+# on network validation, see net_fix.sh). A spinning wizard also burns CPU.
+# Mark the device provisioned and disable the wizard packages in the GUEST
+# (guest /data/system only) before the launcher is started, then force HOME.
+# Undo: echo 0 > $STAGE/skip_setup, then in the guest
+#   pm enable com.google.android.setupwizard (and/or org.lineageos.setupwizard)
+WIZARD_DONE=0
+skip_setup() {
+    is_off "$(flag skip_setup on)" && { WIZARD_DONE=1; return 0; }
+    gx /system/bin/settings put global device_provisioned 1 >/dev/null 2>&1 || return 1
+    gx /system/bin/settings put secure user_setup_complete 1 >/dev/null 2>&1 || return 1
+    [ "$(gx /system/bin/settings get secure user_setup_complete 2>/dev/null)" = "1" ] || return 1
+    for wiz in com.google.android.setupwizard org.lineageos.setupwizard com.android.provision; do
+        gx /system/bin/pm path "$wiz" >/dev/null 2>&1 || continue
+        gx /system/bin/pm disable-user --user 0 "$wiz" >/dev/null 2>&1 && \
+            echo "[UI Activator] setup wizard $wiz disabled in the guest"
+        gx /system/bin/am force-stop "$wiz" >/dev/null 2>&1
+    done
+    WIZARD_DONE=1
+    echo "[UI Activator] device marked provisioned, setup wizard skipped"
+}
+
 early_tweaks() {
+    [ "$WIZARD_DONE" = 1 ] || skip_setup
     if [ "$SAFETY_DONE" = 0 ]; then
         if is_off "$(flag gms_safety_fix on)"; then
             SAFETY_DONE=1
@@ -864,6 +889,8 @@ while true; do
             $BB nsenter -t $PID -m /system/bin/cmd overlay enable-exclusive --category com.android.internal.systemui.navbar.gestural 2>/dev/null || true
             $BB nsenter -t $PID -m /system/bin/settings put secure navigation_mode 2 2>/dev/null || true
             $BB nsenter -t $PID -m /system/bin/pm disable android.ext.services/android.ext.services.notification.Assistant 2>/dev/null || true
+            # Setup wizard skip must land before HOME is started below.
+            [ "$WIZARD_DONE" = 1 ] || skip_setup || echo "[UI Activator] WARNING: setup wizard skip failed (settings provider not ready?)"
             $BB nsenter -t $PID -m /system/bin/input keyevent 224
             $BB nsenter -t $PID -m /system/bin/input keyevent 82
             $BB nsenter -t $PID -m /system/bin/am unlock-user 0
