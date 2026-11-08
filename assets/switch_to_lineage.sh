@@ -121,6 +121,9 @@ dns_servers|(network)|force resolvers, comma separated
 net_bounce|0|allow toggling Wi-Fi as a last-resort DNS fix
 density|540|guest display density (dpi)
 font_scale|(unset)|guest font scale, e.g. 0.9
+adb_framework_block|on|hide the adbd control socket from Lineage (adb hang)
+key_escape|on|hold Volume Up + Down 3 s to return to One UI
+cutout_fix|on|give the guest the One UI camera cutout (status bar position)
 adb_tcp|0|adb over Wi-Fi port (e.g. 5555), next Switch
 adb_watchdog_interval|1|seconds between adb watchdog checks'
 
@@ -314,6 +317,27 @@ while true; do
         setprop ctl.start adbd 2>/dev/null
         log "restarted adbd (was: $st, usb.state=$usb, usb.config=$cfg)"
     fi
+    # Every ~15 s keep a snapshot of where adbd's threads are waiting, so an
+    # adb hang (every service stuck, device still listed) can be traced after
+    # returning to One UI: /data/local/tmp/adbd_threads.txt (+ .prev).
+    if [ $((i % 15)) -eq 1 ]; then
+        ap=$(pidof adbd 2>/dev/null)
+        if [ -n "$ap" ] && [ -d "/proc/${ap%% *}/task" ]; then
+            ap=${ap%% *}
+            snap=${ADBW_SNAP:-/data/local/tmp/adbd_threads.txt}
+            [ -f "$snap" ] && mv -f "$snap" "$snap.prev"
+            {
+                echo "$(date) adbd pid $ap usb.state=$usb"
+                for t in /proc/$ap/task/*; do
+                    c=""; w=""; s=""
+                    read -r c < "$t/comm" 2>/dev/null
+                    read -r w < "$t/wchan" 2>/dev/null
+                    s=$(grep -m1 '^State:' "$t/status" 2>/dev/null)
+                    echo "  ${t##*/} $c ${s#State:} wchan=$w"
+                done
+            } > "$snap" 2>/dev/null
+        fi
+    fi
     [ "$MAX_ITER" -gt 0 ] && [ "$i" -ge "$MAX_ITER" ] && exit 0
 done
 ADBW
@@ -324,6 +348,68 @@ ADBW
         nohup /system/bin/sh /data/local/tmp/adb_watchdog.sh </dev/null >/dev/null 2>&1 &
     fi
     echo "adbd watchdog started (log: /data/local/tmp/adb_watchdog.log)"
+fi
+
+# --- VOLUME-KEY ESCAPE -----------------------------------------------------
+# When adb is dead and Lineage misbehaves, the only way back used to be a hard
+# restart. Holding Volume Up + Volume Down together for 3 s now runs
+# return_to_oneui.sh. It reads key events from the host namespace with
+# getevent (it does not grab the devices, Lineage still sees the keys).
+# Off: echo 0 > $STAGE/key_escape    Hold time: echo 5 > $STAGE/key_escape_secs
+pkill -f "key_escape.sh" 2>/dev/null || true
+if is_off "$(flag key_escape on)"; then
+    echo "volume-key escape disabled by $STAGE/key_escape"
+else
+    cat > /data/local/tmp/key_escape.sh <<'KEYESC'
+#!/system/bin/sh
+STAGE=${STAGE:-/data/local/tmp/lineage_stage}
+LOG=${KEYESC_LOG:-/data/local/tmp/key_escape.log}
+RETURN_SCRIPT=${RETURN_SCRIPT:-$STAGE/return_to_oneui.sh}
+GETEVENT=${GETEVENT:-getevent -lq}
+SH=${KEYESC_SH:-/system/bin/sh}
+HOLD=$(cat "$STAGE/key_escape_secs" 2>/dev/null | tr -dc '0-9')
+[ -n "$HOLD" ] && [ "$HOLD" -gt 0 ] || HOLD=3
+BOTH=${KEYESC_STATE:-/data/local/tmp/key_escape.both}
+log() { echo "$(date) $*" >> "$LOG"; }
+rm -f "$BOTH"
+up=0; down=0
+log "key escape armed (hold ${HOLD}s)"
+$GETEVENT 2>/dev/null | while read -r dev typ key val rest; do
+    [ "$typ" = EV_KEY ] || continue
+    case "$val" in DOWN) v=1 ;; UP) v=0 ;; *) continue ;; esac
+    case "$key" in
+        KEY_VOLUMEUP) up=$v ;;
+        KEY_VOLUMEDOWN) down=$v ;;
+        *) continue ;;
+    esac
+    if [ "$up" = 1 ] && [ "$down" = 1 ]; then
+        if [ ! -f "$BOTH" ]; then
+            tok=$$.$(date +%s)
+            echo "$tok" > "$BOTH"
+            # Fire only if this very press is still held after HOLD seconds.
+            ( sleep "$HOLD"
+              if [ "$(cat "$BOTH" 2>/dev/null)" = "$tok" ]; then
+                  echo "$(date) both volume keys held ${HOLD}s -> returning to One UI" >> "$LOG"
+                  rm -f "$BOTH"
+                  if command -v setsid >/dev/null 2>&1; then
+                      setsid "$SH" "$RETURN_SCRIPT" </dev/null >"$STAGE/key_escape_return.log" 2>&1 &
+                  else
+                      nohup "$SH" "$RETURN_SCRIPT" </dev/null >"$STAGE/key_escape_return.log" 2>&1 &
+                  fi
+              fi ) &
+        fi
+    else
+        rm -f "$BOTH"
+    fi
+done
+KEYESC
+    chmod 755 /data/local/tmp/key_escape.sh
+    if command -v setsid >/dev/null 2>&1; then
+        setsid /system/bin/sh /data/local/tmp/key_escape.sh </dev/null >/dev/null 2>&1 &
+    else
+        nohup /system/bin/sh /data/local/tmp/key_escape.sh </dev/null >/dev/null 2>&1 &
+    fi
+    echo "volume-key escape started (hold Volume Up + Down to return to One UI)"
 fi
 
 # --- THERMAL SAFETY VALVE (untested on device) ----------------------------
@@ -860,6 +946,44 @@ done
 chmod 755 "$GFLAGS" 2>/dev/null
 chmod 644 "$GFLAGS"/* 2>/dev/null
 
+# --- CAMERA CUTOUT (status bar position) ----------------------------------
+# Verified on an S26 Ultra: the GSI enables its noCutoutGSI overlay, so the
+# guest's DisplayCutout is empty and its status bar is 95 px tall, while the
+# punch hole is 80 x 139 px at the top centre. Clock and icons are laid out as
+# if there were no hole. One UI reports the hole as a path in dp at ITS
+# density ("M 0,0 H -10.67 V 37.07 H 10.67 V 0 H 0 Z @dp", density 3.75);
+# the guest runs at another density, so convert it to pixels here, while One
+# UI is still up, and let ui_activator apply it as a fabricated overlay.
+# Off: echo 0 > $STAGE/cutout_fix   Manual spec (px): $STAGE/cutout_spec
+rm -f "$STAGE/cutout_spec.auto" 2>/dev/null
+if ! is_off "$(flag cutout_fix on)"; then
+    _dw=$(dumpsys window displays 2>/dev/null)
+    _spec=$(echo "$_dw" | grep -o -m1 'cutoutSpec={[^}]*}' | sed 's/^cutoutSpec={//; s/}$//')
+    _dens=$(echo "$_dw" | grep -o -m1 'density={[0-9.]*}' | tr -dc '0-9.')
+    case "$_spec" in
+        *@dp*)
+            if [ -n "$_dens" ]; then
+                echo "$_spec" | sed 's/@dp//' | awk -v d="$_dens" '{
+                    out = ""
+                    for (i = 1; i <= NF; i++) {
+                        n = split($i, part, ",")
+                        tok = ""
+                        for (j = 1; j <= n; j++) {
+                            v = part[j]
+                            if (v ~ /^-?[0-9.]+$/) v = sprintf("%.0f", v * d)
+                            tok = tok (j > 1 ? "," : "") v
+                        }
+                        out = out (i > 1 ? " " : "") tok
+                    }
+                    print out
+                }' > "$STAGE/cutout_spec.auto"
+            fi ;;
+        "") ;;
+        *) echo "$_spec" > "$STAGE/cutout_spec.auto" ;;
+    esac
+    [ -s "$STAGE/cutout_spec.auto" ] && echo "host cutout (px): $(cat "$STAGE/cutout_spec.auto")"
+fi
+
 # --- MOUNT PREPARATION ---
 echo "=== [5/6] Executing Mount Hierarchy Preparation ==="
 /system/bin/sh "$STAGE/master_prepare.sh"
@@ -1027,6 +1151,33 @@ skip_setup() {
     echo "[UI Activator] device marked provisioned, setup wizard skipped"
 }
 
+# Give the guest the host's punch-hole cutout (see "CAMERA CUTOUT" in the host
+# part). A fabricated overlay on android sets config_mainBuiltInDisplayCutout
+# and its rect approximation; the GSI's noCutout overlays are switched off so
+# ours wins. Everything is logged so a wrong result can be undone with
+# `cmd overlay disable` or by turning cutout_fix off.
+apply_cutout() {
+    is_off "$(flag cutout_fix on)" && { echo "[UI Activator] cutout fix off"; return 0; }
+    spec=$(cat "$STAGE/cutout_spec" 2>/dev/null)
+    [ -n "$spec" ] || spec=$(cat "$STAGE/cutout_spec.auto" 2>/dev/null)
+    [ -n "$spec" ] || { echo "[UI Activator] no cutout spec, skipping"; return 0; }
+    for res in config_mainBuiltInDisplayCutout config_mainBuiltInDisplayCutoutRectApproximation; do
+        o=$(gx /system/bin/cmd overlay fabricate --target android --name "ol_$res" \
+            "android:string/$res" 0x03 "$spec" 2>&1)
+        echo "[UI Activator] fabricate $res: ${o:-ok}"
+    done
+    for ov in $(gx /system/bin/cmd overlay list android 2>/dev/null | grep -o '[^ ]*:ol_config_[A-Za-z]*'); do
+        o=$(gx /system/bin/cmd overlay enable "$ov" 2>&1)
+        echo "[UI Activator] enable $ov: ${o:-ok}"
+    done
+    for ov in com.android.internal.display.cutout.emulation.noCutoutGSI \
+              com.android.internal.display.cutout.emulation.noCutout; do
+        gx /system/bin/cmd overlay disable "$ov" >/dev/null 2>&1 && \
+            echo "[UI Activator] disabled $ov"
+    done
+    echo "[UI Activator] cutout spec applied: $spec"
+}
+
 # Status bar / shade size: the bar height is max(cutout safe inset, 24 dp).
 # The host's punch-hole cutout is ~139 px tall, i.e. ~41 dp at 540 dpi, so the
 # cutout - not the density - probably decides the bar height, while icons and
@@ -1114,6 +1265,7 @@ while true; do
             LDENS=$(cat "$STAGE/density" 2>/dev/null | tr -dc '0-9')
             [ -n "$LDENS" ] || LDENS=540
             $BB nsenter -t $PID -m /system/bin/wm density "$LDENS" 2>/dev/null || true
+            apply_cutout
             # Text size independent of density (status bar clock, shade, apps).
             # Unset by default. e.g. echo 0.9 > $STAGE/font_scale
             LFS=$(flag font_scale "")

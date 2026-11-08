@@ -114,5 +114,23 @@ echo "[Pivoted Root] App storage sweeper started..."
 echo "[Pivoted Root] Cleaning stale sockets..."
 rm -f /dev/socket/zygote /dev/socket/usap_pool_primary 2>/dev/null || true
 
+# adbd stays One UI's (Android 17). Seen on an S26 Ultra: Lineage's
+# AdbDebuggingManager connects to adbd's control socket right after boot and
+# within about a minute every adb service hangs, even `adb reboot`, while
+# usb.state never changes (so the gadget was not rebuilt). Hide the socket
+# from Lineage only: adbd keeps checking known keys itself, the framework just
+# gets "connection refused". This namespace is private (make-rprivate above),
+# so One UI's /dev/socket/adbd is untouched.
+# Off: echo 0 > /data/local/tmp/lineage_stage/adb_framework_block
+case "$(cat /data/local/tmp/lineage_flags/adb_framework_block 2>/dev/null | tr -d ' \t\r\n')" in
+    0|off|false|no) echo "[Pivoted Root] adb framework socket left visible (flag)" ;;
+    *)
+        if [ -S /dev/socket/adbd ] && $BB mount --bind /dev/null /dev/socket/adbd 2>/dev/null; then
+            echo "[Pivoted Root] adbd control socket hidden from Lineage"
+        else
+            echo "[Pivoted Root] could not hide adbd control socket"
+        fi ;;
+esac
+
 echo "[Pivoted Root] Launching LineageOS Zygote & SystemServer via zygote_exec..."
 exec /data/zygote_exec
