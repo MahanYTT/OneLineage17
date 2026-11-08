@@ -97,12 +97,15 @@ fi
 
 # name|default|meaning   (keep in sync with CHANGES_TO_TEST.md)
 FLAGS_TABLE='thermal_guard|on|thermal safety valve: on, log (dry run) or 0
-thermal_soft_c|85|C at which CPUs get capped (after 20 s)
-thermal_softcap_pct|70|cap in % of max frequency, 0 = never cap
+thermal_basecap_pct|70|CPU cap in % of max for the whole Lineage session, 0 = none
+thermal_soft_c|85|C at which CPUs get capped harder
+thermal_soft_secs|4|seconds above thermal_soft_c before the hard cap
+thermal_softcap_pct|50|hard cap in % of max frequency, 0 = never cap
 thermal_trip_c|95|C at which Lineage is exited
 thermal_trip_secs|30|seconds above thermal_trip_c before exiting
 thermal_batt_c|47|battery C that exits Lineage after 60 s
 thermal_zones|(cpu/gpu/nsp...)|grep -E regex of zone types to watch
+thermal_zones_exclude|(trip/limit)|grep -E regex of zone types to skip (trip points)
 crashloop_guard|on|disable crash-looping apps in the guest: on, log or 0
 crashloop_limit|5|crashes ...
 crashloop_window_s|180|... within this many seconds
@@ -141,6 +144,8 @@ setflag() {
 temps() {
     for z in "$TZ_ROOT"/thermal_zone*; do
         read -r t < "$z/type" 2>/dev/null || continue
+        # cpu-hw-trip-* report their fixed trip point (105 C), not a temperature
+        case "$t" in *trip*|*limit*) continue ;; esac
         read -r v < "$z/temp" 2>/dev/null || continue
         case "$v" in ''|*[!0-9]*) continue ;; esac
         [ "$v" -ge 1000 ] && v=$((v / 1000))
@@ -373,7 +378,11 @@ log() { echo "$(date '+%m-%d %H:%M:%S') $*" >> "$LOG"; }
 load_config() {
     MODE=$(flag thermal_guard on)
     SOFT_C=$(num "$(flag thermal_soft_c 85)" 85)
-    CAP_PCT=$(num "$(flag thermal_softcap_pct 70)" 70)
+    SOFT_S=$(num "$(flag thermal_soft_secs 4)" 4)
+    CAP_PCT=$(num "$(flag thermal_softcap_pct 50)" 50)
+    BASE_PCT=$(num "$(flag thermal_basecap_pct 70)" 70)
+    [ "$BASE_PCT" -gt 100 ] && BASE_PCT=100
+    [ "$BASE_PCT" -gt 0 ] && [ "$BASE_PCT" -lt 30 ] && BASE_PCT=30
     TRIP_C=$(num "$(flag thermal_trip_c 95)" 95)
     TRIP_S=$(num "$(flag thermal_trip_secs 30)" 30)
     BATT_C=$(num "$(flag thermal_batt_c 47)" 47)
@@ -382,9 +391,12 @@ load_config() {
     EMERG_C=$((TRIP_C + 8))
     step=${INTERVAL:-2}; [ "$step" -gt 0 ] 2>/dev/null || step=1
     TRIP_N=$(( (TRIP_S + step - 1) / step ))
-    SOFT_N=$(( (20 + step - 1) / step ))
+    SOFT_N=$(( (SOFT_S + step - 1) / step ))
     COOL_N=$(( (60 + step - 1) / step ))
-    EMERG_N=$(( (6 + step - 1) / step ))
+    # 12 s, not 6: on the S26 Ultra a core sensor spikes to the 105 C
+    # hardware limit for a few seconds while Lineage boots, and the kernel
+    # throttles it on its own. Only a sustained reading should end the session.
+    EMERG_N=$(( (12 + step - 1) / step ))
     BATT_N=$(( (60 + step - 1) / step ))
 }
 
@@ -393,9 +405,17 @@ load_config() {
 select_zones() {
     ZONES=""
     re=$(flag thermal_zones 'cpu|gpu|cpuss|gpuss|apc|nsp|aoss|ddr')
+    # Verified on the S26 Ultra: cpu-hw-trip-0/1 are not sensors, they always
+    # read their hardware trip point (105000). Watching them made the guard
+    # "trip" 4 s after start and run return_to_oneui.sh in the middle of
+    # master_prepare.sh, which tore down the rootfs (pivot_root failed, phone
+    # stuck on the Samsung boot screen). Skip trip-point/limit pseudo-zones.
+    # Override: echo 'trip|limit|foo' > $STAGE/thermal_zones_exclude
+    ex=$(flag thermal_zones_exclude 'trip|limit')
     for z in "$TZ_ROOT"/thermal_zone*; do
         [ -r "$z/temp" ] && [ -r "$z/type" ] || continue
         read -r t < "$z/type" 2>/dev/null || continue
+        if [ -n "$ex" ] && echo "$t" | grep -qiE "$ex"; then continue; fi
         if echo "$t" | grep -qiE "$re"; then
             ZONES="$ZONES $z"
         fi
@@ -424,15 +444,16 @@ sample() {
 
 zone_name() { _t=""; [ -n "$1" ] && read -r _t < "$1/type" 2>/dev/null; echo "${_t:-none}"; }
 
-cap_cpus() {
-    [ "$CAP_PCT" -gt 0 ] || return 0
+cap_cpus() { # cap_cpus [PCT]  (default: CAP_PCT)
+    pct=${1:-$CAP_PCT}
+    [ "$pct" -gt 0 ] || return 0
     for p in "$CPUFREQ_ROOT"/policy*; do
         [ -w "$p/scaling_max_freq" ] && [ -r "$p/cpuinfo_max_freq" ] || continue
         read -r cur < "$p/scaling_max_freq" || continue
         read -r hw < "$p/cpuinfo_max_freq" || continue
         grep -q "^$p/scaling_max_freq " "$CAP_SAVE" 2>/dev/null || \
             echo "$p/scaling_max_freq $cur" >> "$CAP_SAVE"
-        target=$((hw * CAP_PCT / 100))
+        target=$((hw * pct / 100))
         best=""
         if [ -r "$p/scaling_available_frequencies" ]; then
             for f in $(cat "$p/scaling_available_frequencies"); do
@@ -492,6 +513,20 @@ select_zones
 log "thermal guard start: mode=$MODE soft=${SOFT_C}C cap=${CAP_PCT}% trip=${TRIP_C}C/${TRIP_S}s emergency=${EMERG_C}C batt=${BATT_C}C zones:$(for z in $ZONES; do printf ' %s' "$(zone_name "$z")"; done)"
 [ -n "$ZONES" ] || log "WARNING: no thermal zone matched; only the battery is watched"
 
+# Baseline cap for the whole session. Evidence (S26 Ultra, One UI 9): with One
+# UI's framework gone, Samsung's SSRM no longer limits CPU frequency, and a core
+# sensor went from 45 C to the 105 C hardware limit about 30 s into Lineage's
+# boot (CPUs ~92 % busy: system_server, GMS, Google app, Play Store). Running
+# below max all the time is what SSRM would have done. The originals are saved
+# and put back by restore_cpus / return_to_oneui.sh.
+# Off: echo 0 > $STAGE/thermal_basecap_pct
+case "$MODE" in log|dry|dryrun|dry-run) ;; *)
+    if [ "$BASE_PCT" -gt 0 ]; then
+        log "baseline cap ${BASE_PCT}% for the Lineage session"
+        cap_cpus "$BASE_PCT"
+    fi ;;
+esac
+
 hot=0; emerg=0; batt_hot=0; soft=0; cool=0; capped=0; i=0
 while true; do
     i=$((i + 1))
@@ -511,7 +546,7 @@ while true; do
 
     reason=""
     if [ "$emerg" -ge "$EMERG_N" ]; then
-        reason="$(zone_name "$MAX_ZONE") at ${MAX_C}C (>= ${EMERG_C}C for 6 s)"
+        reason="$(zone_name "$MAX_ZONE") at ${MAX_C}C (>= ${EMERG_C}C for 12 s)"
     elif [ "$hot" -ge "$TRIP_N" ]; then
         reason="$(zone_name "$MAX_ZONE") at ${MAX_C}C (>= ${TRIP_C}C for ${TRIP_S} s)"
     elif [ "$batt_hot" -ge "$BATT_N" ]; then
@@ -524,14 +559,20 @@ while true; do
     fi
 
     if [ "$soft" -ge "$SOFT_N" ] && [ "$capped" = 0 ]; then
-        log "soft limit: $(zone_name "$MAX_ZONE") at ${MAX_C}C for 20 s"
+        log "soft limit: $(zone_name "$MAX_ZONE") at ${MAX_C}C for ${SOFT_S} s"
         top_snapshot
         if [ "$act" = 1 ]; then cap_cpus; capped=1; fi
         soft=0
     fi
     if [ "$capped" = 1 ] && [ "$cool" -ge "$COOL_N" ]; then
-        log "cooled to ${MAX_C}C for 60 s, lifting cap"
-        restore_cpus; capped=0; cool=0
+        if [ "$BASE_PCT" -gt 0 ] && [ "$act" = 1 ]; then
+            log "cooled to ${MAX_C}C for 60 s, lifting cap to the ${BASE_PCT}% baseline"
+            cap_cpus "$BASE_PCT"
+        else
+            log "cooled to ${MAX_C}C for 60 s, lifting cap"
+            restore_cpus
+        fi
+        capped=0; cool=0
     fi
 
     if [ $((i % 15)) -eq 1 ]; then

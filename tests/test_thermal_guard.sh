@@ -22,6 +22,8 @@ setup() {
     mkzone "$T" 1 gpuss-0 44000
     mkzone "$T" 2 battery 99000      # not a SoC zone: must be ignored
     mkzone "$T" 3 pm8550_tz 120000   # PMIC zone: must be ignored
+    mkzone "$T" 4 cpu-hw-trip-0 105000  # trip-point pseudo-zone (S26 Ultra): must be ignored
+    echo 0 > "$T/stage/thermal_basecap_pct"  # baseline cap has its own tests below
 }
 
 run_guard() { # run_guard ITERATIONS
@@ -55,7 +57,12 @@ assert_no_file "$T/returned" "97C for only 25s: no trip yet"
 setup
 settemp "$T" 1 104000
 run_guard 7
-assert_file "$T/returned" "104C: emergency trip within 6s"
+assert_no_file "$T/returned" "104C for 6s (boot spike): no trip"
+
+setup
+settemp "$T" 1 104000
+run_guard 13
+assert_file "$T/returned" "104C: emergency trip within 12s"
 
 setup
 settemp "$T" 0 200000
@@ -78,8 +85,8 @@ assert_eq "$(cat "$T/cpufreq/policy0/scaling_max_freq")" 3000000 "log mode: neve
 setup
 settemp "$T" 0 88000
 run_guard 22
-assert_eq "$(cat "$T/cpufreq/policy0/scaling_max_freq")" 2000000 "88C for 20s: caps policy0 to 70% (nearest step)"
-assert_eq "$(cat "$T/cpufreq/policy6/scaling_max_freq")" 2000000 "88C for 20s: caps policy6"
+assert_eq "$(cat "$T/cpufreq/policy0/scaling_max_freq")" 1000000 "88C for 20s: caps policy0 to 50% (nearest step)"
+assert_eq "$(cat "$T/cpufreq/policy6/scaling_max_freq")" 1000000 "88C for 20s: caps policy6"
 assert_file "$T/stage/thermal_cpufreq.saved" "cap saves original limits"
 assert_no_file "$T/returned" "88C: soft stage does not exit Lineage"
 
@@ -110,5 +117,45 @@ echo 99 > "$T/stage/thermal_trip_c"
 settemp "$T" 0 97000
 run_guard 40
 assert_no_file "$T/returned" "thermal_trip_c=99 raises the trip point"
+
+setup
+settemp "$T" 0 88000
+run_guard 5
+assert_eq "$(cat "$T/cpufreq/policy0/scaling_max_freq")" 1000000 "88C for 4s: hard cap already applied"
+
+# --- baseline cap (thermal_basecap_pct, default 70) ---
+setup
+rm -f "$T/stage/thermal_basecap_pct"
+run_guard 3
+assert_eq "$(cat "$T/cpufreq/policy0/scaling_max_freq")" 2000000 "baseline: 70% cap from the start"
+assert_file "$T/stage/thermal_cpufreq.saved" "baseline: originals saved"
+assert_grep "3000000" "$T/stage/thermal_cpufreq.saved" "baseline: saves the uncapped value"
+
+setup
+rm -f "$T/stage/thermal_basecap_pct"
+echo log > "$T/stage/thermal_guard"
+run_guard 3
+assert_eq "$(cat "$T/cpufreq/policy0/scaling_max_freq")" 3000000 "baseline: never applied in log mode"
+
+setup
+rm -f "$T/stage/thermal_basecap_pct"
+cat > "$T/heat.sh" <<EOF
+n=0
+sleep() { n=\$((n + 1)); if [ \$n -ge 25 ]; then echo 50000 > "$T/thermal/thermal_zone0/temp"; fi; }
+. "$GUARD"
+EOF
+settemp "$T" 0 88000
+STAGE="$T/stage" TZ_ROOT="$T/thermal" BATT_TEMP="$T/batt_temp" \
+CPUFREQ_ROOT="$T/cpufreq" THERMAL_LOG="$T/log" THERMAL_INTERVAL=1 \
+THERMAL_MAX_ITER=100 GUARD_SH=sh "$TEST_SH" "$T/heat.sh" >/dev/null 2>&1
+assert_eq "$(cat "$T/cpufreq/policy0/scaling_max_freq")" 2000000 "baseline: cooling returns to the baseline, not full speed"
+assert_grep "3000000" "$T/stage/thermal_cpufreq.saved" "baseline: originals still saved after cooling"
+
+setup
+rm -f "$T/stage/thermal_basecap_pct"
+settemp "$T" 0 97000
+run_guard 40
+assert_file "$T/returned" "baseline: trip still returns to One UI"
+assert_eq "$(cat "$T/cpufreq/policy0/scaling_max_freq")" 3000000 "baseline: trip restores original limits"
 
 finish
