@@ -80,10 +80,8 @@ mount | grep -q "$ROOTFS/vendor_dlkm " || $BB mount --bind /vendor_dlkm "$ROOTFS
 # tries to parse those exact paths inside this namespace. Keep the apex
 # directories identical to what host apexd sees (an empty tmpfs or the GSI's
 # own .capex layout makes PMS abort with "Unable to parse" at boot).
-if [ -d /system_ext/apex ]; then
-    mkdir -p "$ROOTFS/system/system_ext/apex"
-    mount | grep -q "$ROOTFS/system/system_ext/apex " || $BB mount --bind /system_ext/apex "$ROOTFS/system/system_ext/apex"
-fi
+# Note: /system/apex and /system_ext/apex are bound AFTER step 8 so payload
+# extraction can read the GSI's own /system/apex and /system/system_ext/apex first.
 if [ -d /product/apex ]; then
     if [ ! -d "$ROOTFS/system/product/apex" ]; then
         mkdir -p "$STAGE/product_ov"
@@ -601,7 +599,9 @@ mount_payload() {
     DEST="$ROOTFS/apex/$TARGET"
     if [ ! -f "$IMG" ]; then
         CAPEX="$ROOTFS/system/apex/com.android.${NAME}.capex"
+        [ -f "$CAPEX" ] || CAPEX="$ROOTFS/system/system_ext/apex/com.android.${NAME}.capex"
         APEX="$ROOTFS/system/apex/com.android.${NAME}.apex"
+        [ -f "$APEX" ] || APEX="$ROOTFS/system/system_ext/apex/com.android.${NAME}.apex"
         if [ -f "$CAPEX" ]; then
             $BB unzip -p "$CAPEX" original_apex > "$STAGE/temp_${NAME}.apex" 2>/dev/null
             $BB unzip -p "$STAGE/temp_${NAME}.apex" apex_payload.img > "$IMG" 2>/dev/null
@@ -682,14 +682,20 @@ mount_payload "neuralnetworks" "com.android.neuralnetworks"
 mount_payload "resolv" "com.android.resolv"
 mount_payload "uprobestats" "com.android.uprobestats"
 mount_payload "adbd" "com.android.adbd"
+mount_payload "compos" "com.android.compos"
+mount_payload "apex.cts.shim" "com.android.apex.cts.shim"
 
-# Payload extractions above used the GSI's own /system/apex files. Now that the
-# images are cached, present the HOST's /system/apex to the container so the
-# preinstalled paths reported by host apexd all resolve (see the note above
-# about /system_ext/apex).
+# Payload extractions above used the GSI's own /system/apex and /system/system_ext/apex
+# files. Now that the images are cached, present the HOST's /system/apex and
+# /system_ext/apex to the container so the preinstalled paths reported by host
+# apexd all resolve.
 if [ -d /system/apex ]; then
     mkdir -p "$ROOTFS/system/apex"
     mount | grep -q "$ROOTFS/system/apex " || $BB mount --bind /system/apex "$ROOTFS/system/apex"
+fi
+if [ -d /system_ext/apex ]; then
+    mkdir -p "$ROOTFS/system/system_ext/apex"
+    mount | grep -q "$ROOTFS/system/system_ext/apex " || $BB mount --bind /system_ext/apex "$ROOTFS/system/system_ext/apex"
 fi
 
 echo "=== 9. Bind-mounting Remaining Non-Payload APEXes ==="
@@ -700,13 +706,9 @@ for a in /apex/*; do
         *samsung*)
             continue
             ;;
-        com.android.*)
-            # All com.android.* APEXes from GSI are mounted via direct payload!
-            # Never bind-mount host copies of any com.android.* APEX!
-            continue
-            ;;
     esac
-    # Skip if already mounted
+    # Skip if already mounted (all 37 GSI com.android.* APEXes and their @version
+    # dirs are already mounted above in Step 8)
     if ! mount | grep -q "$ROOTFS/apex/$base "; then
         mkdir -p "$ROOTFS/apex/$base"
         $BB mount --bind "$a" "$ROOTFS/apex/$base" 2>/dev/null || true
