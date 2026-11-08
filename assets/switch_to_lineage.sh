@@ -88,6 +88,10 @@ while true; do
     fi
     case "$cfg" in
         *adb*) ;;
+        ""|none)
+            setprop sys.usb.config adb 2>/dev/null
+            echo "$(date) set usb.config to adb (was: $cfg)" >> "$LOG"
+            ;;
         *)
             setprop sys.usb.config "$cfg,adb" 2>/dev/null
             echo "$(date) added adb to usb.config (was: $cfg)" >> "$LOG"
@@ -95,17 +99,17 @@ while true; do
     esac
     case "$usb" in
         *adb*) ;;
-        "")
-            ;;
         *)
             now=$(date +%s 2>/dev/null || echo 0)
-            if [ $((now - last_toggle)) -gt 300 ]; then
+            if [ $((now - last_toggle)) -gt 30 ]; then
                 last_toggle=$now
                 echo "$(date) gadget lost adb, toggling (state: $usb, config: $cfg)" >> "$LOG"
                 setprop sys.usb.config none 2>/dev/null
                 sleep 1
-                setprop sys.usb.config rndis,adb 2>/dev/null
-                sleep 2
+                setprop sys.usb.config mtp,adb 2>/dev/null
+                sleep 1
+                [ "$(getprop sys.usb.state)" = "none" ] && setprop sys.usb.config adb 2>/dev/null
+                sleep 1
                 setprop ctl.start adbd 2>/dev/null
             fi
             ;;
@@ -311,6 +315,7 @@ cp -f "$STAGE/zygote_exec" "$STAGE/data/zygote_exec"
 chmod 755 "$STAGE/data/zygote_exec"
 
 # Launch takeover inside isolated mount namespace
+set_prop sys.boot_completed 0
 $BB unshare -m $BB sh "$STAGE/data/master_inner.sh" </dev/null >"$STAGE/data/takeover.log" 2>&1 &
 TAKEOVER_PID=$!
 echo "Takeover daemon PID: $TAKEOVER_PID"

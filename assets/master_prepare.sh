@@ -81,8 +81,17 @@ mount | grep -q "$ROOTFS/vendor_dlkm " || $BB mount --bind /vendor_dlkm "$ROOTFS
 # directories identical to what host apexd sees (an empty tmpfs or the GSI's
 # own .capex layout makes PMS abort with "Unable to parse" at boot).
 if [ -d /system_ext/apex ]; then
-    mkdir -p "$ROOTFS/system_ext/apex"
-    mount | grep -q "$ROOTFS/system_ext/apex " || $BB mount --bind /system_ext/apex "$ROOTFS/system_ext/apex"
+    mkdir -p "$ROOTFS/system/system_ext/apex"
+    mount | grep -q "$ROOTFS/system/system_ext/apex " || $BB mount --bind /system_ext/apex "$ROOTFS/system/system_ext/apex"
+fi
+if [ -d /product/apex ]; then
+    if [ ! -d "$ROOTFS/system/product/apex" ]; then
+        mkdir -p "$STAGE/product_ov"
+        mount | grep -q "$STAGE/product_ov " || $BB mount -t tmpfs tmpfs "$STAGE/product_ov"
+        mkdir -p "$STAGE/product_ov/upper/apex" "$STAGE/product_ov/work"
+        mount | grep -q "$ROOTFS/system/product " || $BB mount -t overlay overlay -o "lowerdir=$ROOTFS/system/product,upperdir=$STAGE/product_ov/upper,workdir=$STAGE/product_ov/work" "$ROOTFS/system/product"
+    fi
+    mount | grep -q "$ROOTFS/system/product/apex " || $BB mount --bind /product/apex "$ROOTFS/system/product/apex"
 fi
 mount | grep -q "$ROOTFS/mnt " || $BB mount --rbind /mnt "$ROOTFS/mnt"
 if [ -f "$STAGE/services_patched.jar" ]; then
@@ -94,6 +103,11 @@ if [ -f "$STAGE/framework_patched.jar" ]; then
     $BB umount -l "$ROOTFS/system/framework/framework.jar" 2>/dev/null || true
     $BB mount --bind "$STAGE/framework_patched.jar" "$ROOTFS/system/framework/framework.jar"
     echo "Bound framework_patched.jar -> $ROOTFS/system/framework/framework.jar"
+fi
+if [ -f "$STAGE/preloaded-classes" ]; then
+    $BB umount -l "$ROOTFS/system/etc/preloaded-classes" 2>/dev/null || true
+    $BB mount --bind "$STAGE/preloaded-classes" "$ROOTFS/system/etc/preloaded-classes"
+    echo "Bound preloaded-classes -> $ROOTFS/system/etc/preloaded-classes"
 fi
 if [ -f "$STAGE/libaudio_aidl_conversion_common_cpp_patched.so" ]; then
     $BB umount -l "$ROOTFS/system/lib64/libaudio_aidl_conversion_common_cpp.so" 2>/dev/null || true
