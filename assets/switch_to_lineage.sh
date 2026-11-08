@@ -20,6 +20,26 @@ set_prop() {
 
 BACKUP_DIR="/data/local/tmp/lineage_backups"
 
+# Toggle files. Every optional behaviour added for the overheating / setup /
+# adb work reads a small file in $STAGE, the same way `density` works:
+#   echo 0 > /data/local/tmp/lineage_stage/<name>   (switch it off)
+#   rm /data/local/tmp/lineage_stage/<name>         (back to the default)
+# /data/local/tmp/lineage_ctl.sh lists them all ("lineage_ctl.sh flags").
+flag() {
+    _v=$(cat "$STAGE/$1" 2>/dev/null | tr -d ' \t\r\n')
+    if [ -n "$_v" ]; then echo "$_v"; else echo "$2"; fi
+}
+is_off() { case "$1" in 0|off|false|no|disable|disabled) return 0 ;; esac; return 1; }
+
+# Host properties changed for the session are recorded here first and put back
+# by return_to_oneui.sh, so One UI never inherits them. An existing file is
+# kept (a session that never returned): it still holds the true originals.
+SAVED_PROPS="$STAGE/saved_props"
+save_set_prop() {
+    grep -q "^$1=" "$SAVED_PROPS" 2>/dev/null || echo "$1=$(getprop "$1")" >> "$SAVED_PROPS"
+    setprop "$1" "$2" 2>/dev/null || true
+}
+
 echo "=== LINEAGEOS 23.2 TAKEOVER STARTING ==="
 
 # Put SELinux in permissive mode for the duration of the takeover. The guest
@@ -130,13 +150,10 @@ fi
 # return_to_oneui.sh restores the original cpufreq limits if the guard dies.
 pkill -f "thermal_guard.sh" 2>/dev/null || true
 rm -f "$STAGE/thermal_tripped" 2>/dev/null || true
-TG_MODE=$(cat "$STAGE/thermal_guard" 2>/dev/null | tr -d ' \t\r\n')
-case "$TG_MODE" in
-    0|off|false|no|disable|disabled)
-        echo "thermal guard disabled by $STAGE/thermal_guard"
-        ;;
-    *)
-        cat > /data/local/tmp/thermal_guard.sh <<'THERMAL'
+if is_off "$(flag thermal_guard on)"; then
+    echo "thermal guard disabled by $STAGE/thermal_guard"
+else
+    cat > /data/local/tmp/thermal_guard.sh <<'THERMAL'
 #!/system/bin/sh
 # OneLineage thermal safety valve. Written by switch_to_lineage.sh; read the
 # comment block there for the evidence and the toggles. Every path can be
@@ -334,15 +351,164 @@ while true; do
     sleep "$INTERVAL"
 done
 THERMAL
-        chmod 755 /data/local/tmp/thermal_guard.sh
-        if command -v setsid >/dev/null 2>&1; then
-            setsid /system/bin/sh /data/local/tmp/thermal_guard.sh </dev/null >/dev/null 2>&1 &
-        else
-            nohup /system/bin/sh /data/local/tmp/thermal_guard.sh </dev/null >/dev/null 2>&1 &
-        fi
-        echo "thermal guard started (log: /data/local/tmp/thermal_guard.log)"
-        ;;
-esac
+    chmod 755 /data/local/tmp/thermal_guard.sh
+    if command -v setsid >/dev/null 2>&1; then
+        setsid /system/bin/sh /data/local/tmp/thermal_guard.sh </dev/null >/dev/null 2>&1 &
+    else
+        nohup /system/bin/sh /data/local/tmp/thermal_guard.sh </dev/null >/dev/null 2>&1 &
+    fi
+    echo "thermal guard started (log: /data/local/tmp/thermal_guard.log)"
+fi
+
+# --- DEXOPT THROTTLE (untested on device) ---------------------------------
+# The guest's ART service asks the HOST artd to compile apps, and artd runs the
+# host's Android 17 dex2oat. The guest's Android 16 runtime rejects that output
+# (oat version mismatch), so any background or boot dexopt in the guest is
+# pure heat: ~200 apps compiled on every core, with nothing usable at the end.
+# Turn background dexopt off and keep dex2oat to a couple of threads while
+# Lineage runs. These are host properties: the originals are saved to
+# $STAGE/saved_props and return_to_oneui.sh restores them before One UI starts.
+# Toggle: echo 0 > $STAGE/dexopt_throttle
+if is_off "$(flag dexopt_throttle on)"; then
+    echo "dexopt throttle disabled by $STAGE/dexopt_throttle"
+else
+    save_set_prop pm.dexopt.disable_bg_dexopt true
+    save_set_prop dalvik.vm.dex2oat-threads 2
+    save_set_prop dalvik.vm.bg-dex2oat-threads 1
+    save_set_prop dalvik.vm.boot-dex2oat-threads 2
+    echo "dexopt throttled (originals in $SAVED_PROPS)"
+fi
+
+# --- CRASH-LOOP GUARD (untested on device) --------------------------------
+# Evidence: host-installed apps that do not fit the Android 16 guest restart
+# forever. GMS (the Android 17 build) died every ~5 s on
+#   IllegalArgumentException: Unexpected safety source: AdvancedProtection
+# and every respawn JIT-compiles from scratch, because no oat file matches the
+# guest runtime. A crash loop is therefore one of the most expensive things the
+# guest can do. This watches the shared crash log buffer and, when one package
+# crashes >= crashloop_limit (5) times within crashloop_window_s (180 s),
+# disables it IN THE GUEST ONLY (`pm disable-user` writes the guest's own
+# /data/system, i.e. $STAGE/data, never One UI's package state).
+# Core packages (android, com.android.*, org.lineageos.*, GMS/GSF/Play Store,
+# launchers, keyboards, WebView) are never disabled, only logged.
+# Log: /data/local/tmp/crashloop_guard.log. Disabled packages are listed in
+# $STAGE/crashloop_disabled.txt; `lineage_ctl.sh crashloop-undo` re-enables them.
+# Toggle: echo 0 > $STAGE/crashloop_guard   (off)
+#         echo log > $STAGE/crashloop_guard (only log what it would disable)
+# Never touch a package: add its name (one per line) to $STAGE/crashloop_allow
+pkill -f "crashloop_guard.sh" 2>/dev/null || true
+if is_off "$(flag crashloop_guard on)"; then
+    echo "crash-loop guard disabled by $STAGE/crashloop_guard"
+else
+    cat > /data/local/tmp/crashloop_guard.sh <<'CRASHLOOP'
+#!/system/bin/sh
+# OneLineage crash-loop guard. Written by switch_to_lineage.sh; read the comment
+# block there for the evidence and the toggles.
+STAGE=${STAGE:-/data/local/tmp/lineage_stage}
+LOG=${CLG_LOG:-/data/local/tmp/crashloop_guard.log}
+EVENTS=${CLG_EVENTS:-/data/local/tmp/crashloop_guard.events}
+DISABLED=${CLG_DISABLED:-$STAGE/crashloop_disabled.txt}
+if [ -z "$BB" ]; then
+    BB=$(which busybox 2>/dev/null || echo "/data/adb/ksu/bin/busybox")
+    [ -x "$BB" ] || BB=$(find /data/adb /system /data -name busybox 2>/dev/null | head -n 1)
+fi
+
+flag() {
+    _v=$(cat "$STAGE/$1" 2>/dev/null | tr -d ' \t\r\n')
+    if [ -n "$_v" ]; then echo "$_v"; else echo "$2"; fi
+}
+num() { case "$1" in ''|*[!0-9]*) echo "$2" ;; *) echo "$1" ;; esac; }
+log() { echo "$(date '+%m-%d %H:%M:%S') $*" >> "$LOG"; }
+
+# Run a command inside the guest's mount namespace (guest pm/am binaries).
+# Refuses unless system_server lives in a different mount namespace from this
+# host-side script, i.e. it really is the guest's and not One UI's.
+guest() {
+    _pid=$(pidof system_server 2>/dev/null | awk '{print $1}')
+    [ -n "$_pid" ] || return 1
+    _ns=$(readlink "/proc/$_pid/ns/mnt" 2>/dev/null)
+    [ -n "$_ns" ] && [ "$_ns" != "$(readlink /proc/self/ns/mnt 2>/dev/null)" ] || return 1
+    "$BB" nsenter -t "$_pid" -m "$@"
+}
+
+protected() {
+    case "$1" in
+        android|system|com.android.*|org.lineageos.*|lineageos.*) return 0 ;;
+        com.google.android.gms|com.google.android.gms.*|com.google.android.gsf|com.google.android.gsf.*) return 0 ;;
+        com.android.vending|com.google.android.ext.*|com.google.android.permissioncontroller) return 0 ;;
+        com.google.android.networkstack*|com.google.android.modulemetadata|com.google.android.packageinstaller) return 0 ;;
+        com.google.android.webview|com.google.android.trichromelibrary*|com.google.android.setupwizard) return 0 ;;
+        com.wewaffles.onelineage|*launcher*|*inputmethod*|*keyboard*) return 0 ;;
+    esac
+    grep -qxF "$1" "$STAGE/crashloop_allow" 2>/dev/null && return 0
+    return 1
+}
+
+# warned PKG: true at most once per window per package, to keep the log short.
+warned() {
+    _now=$(date +%s)
+    _last=$(awk -v p="$1" '$2 == p {t = $1} END {print t + 0}' "$EVENTS.warned" 2>/dev/null)
+    [ $((_now - ${_last:-0})) -lt "$WINDOW" ] && return 0
+    echo "$_now $1" >> "$EVENTS.warned"
+    return 1
+}
+
+on_crash() {
+    pkg=${1%%:*}
+    case "$pkg" in ''|/*|*[!A-Za-z0-9._]*) return 0 ;; esac
+    MODE=$(flag crashloop_guard on)
+    WINDOW=$(num "$(flag crashloop_window_s 180)" 180)
+    LIMIT=$(num "$(flag crashloop_limit 5)" 5)
+    now=$(date +%s)
+    echo "$now $pkg" >> "$EVENTS"
+    awk -v now="$now" -v w="$WINDOW" '$1 >= now - w' "$EVENTS" > "$EVENTS.tmp" 2>/dev/null && mv -f "$EVENTS.tmp" "$EVENTS"
+    n=$(awk -v p="$pkg" '$2 == p {c++} END {print c + 0}' "$EVENTS")
+    [ "$n" -ge "$LIMIT" ] || return 0
+    if protected "$pkg"; then
+        warned "$pkg" || log "crash loop: $pkg crashed $n times in ${WINDOW}s (core package, left alone)"
+        return 0
+    fi
+    case "$MODE" in
+        log|dry|dryrun|dry-run)
+            warned "$pkg" || log "crash loop: $pkg crashed $n times in ${WINDOW}s (log mode: would disable)"
+            return 0 ;;
+    esac
+    if guest /system/bin/pm disable-user --user 0 "$pkg" >/dev/null 2>&1; then
+        guest /system/bin/am force-stop "$pkg" >/dev/null 2>&1
+        grep -qxF "$pkg" "$DISABLED" 2>/dev/null || echo "$pkg" >> "$DISABLED"
+        log "crash loop: $pkg crashed $n times in ${WINDOW}s -> disabled in the guest (undo: lineage_ctl.sh crashloop-undo)"
+        awk -v p="$pkg" '$2 != p' "$EVENTS" > "$EVENTS.tmp" 2>/dev/null && mv -f "$EVENTS.tmp" "$EVENTS"
+    else
+        warned "$pkg" || log "crash loop: $pkg crashed $n times, but pm disable-user failed"
+    fi
+}
+
+: >> "$LOG"
+: > "$EVENTS"
+: > "$EVENTS.warned"
+log "crash-loop guard start: mode=$(flag crashloop_guard on) limit=$(flag crashloop_limit 5) window=$(flag crashloop_window_s 180)s"
+WINDOW=$(num "$(flag crashloop_window_s 180)" 180)
+while true; do
+    since=$(date '+%m-%d %H:%M:%S.000')
+    logcat -b crash -v brief -T "$since" 2>/dev/null | while IFS= read -r line; do
+        case "$line" in
+            *"Process: "*", PID: "*)
+                p=${line#*Process: }; on_crash "${p%%,*}" ;;
+            *">>> "*" <<<"*)
+                p=${line#*>>> }; on_crash "${p%% <<<*}" ;;
+            *"Unexpected safety source"*)
+                warned safetycenter || log "GMS still hits SafetyCenter: '${line#*: }' (check gms_safety_fix / ui_activator.log)" ;;
+        esac
+    done
+    [ -n "$CLG_ONCE" ] && exit 0
+    sleep 5
+done
+CRASHLOOP
+    chmod 755 /data/local/tmp/crashloop_guard.sh
+    # Started only after the takeover is launched (see below): before that the
+    # system_server on this phone is One UI's, and it must never be touched.
+    START_CRASHLOOP_GUARD=1
+fi
 
 # Start persistent logcat capture for takeover diagnostics
 pkill -f "takeover_logcat.log" 2>/dev/null || true
@@ -443,6 +609,22 @@ if [ -d "$APP_FILES" ]; then
     done
 fi
 chmod 755 "$STAGE"/*.sh "$STAGE/zygote_exec" 2>/dev/null || true
+
+# Toggle files for scripts that run INSIDE the guest (net_fix.sh,
+# app_storage_loop.sh) cannot be read from $STAGE after the pivot, so mirror the
+# small ones into the guest's /data/local/tmp/lineage_flags. Only plain files
+# with lowercase names, no dot and <= 256 bytes are copied (density,
+# net_bounce, ...), never images or scripts. lineage_ctl.sh writes both copies.
+GFLAGS="$STAGE/data/local/tmp/lineage_flags"
+rm -rf "$GFLAGS" 2>/dev/null
+mkdir -p "$GFLAGS"
+for f in "$STAGE"/*; do
+    b=${f##*/}
+    case "$b" in *[!a-z0-9_]*) continue ;; esac
+    [ -f "$f" ] && [ "$(wc -c < "$f")" -le 256 ] && cp -f "$f" "$GFLAGS/$b" 2>/dev/null
+done
+chmod 755 "$GFLAGS" 2>/dev/null
+chmod 644 "$GFLAGS"/* 2>/dev/null
 
 # --- MOUNT PREPARATION ---
 echo "=== [5/6] Executing Mount Hierarchy Preparation ==="
@@ -549,6 +731,15 @@ $BB unshare -m $BB sh "$STAGE/data/master_inner.sh" </dev/null >"$STAGE/data/tak
 TAKEOVER_PID=$!
 echo "Takeover daemon PID: $TAKEOVER_PID"
 
+if [ "${START_CRASHLOOP_GUARD:-0}" = 1 ]; then
+    if command -v setsid >/dev/null 2>&1; then
+        setsid /system/bin/sh /data/local/tmp/crashloop_guard.sh </dev/null >/dev/null 2>&1 &
+    else
+        nohup /system/bin/sh /data/local/tmp/crashloop_guard.sh </dev/null >/dev/null 2>&1 &
+    fi
+    echo "crash-loop guard started (log: /data/local/tmp/crashloop_guard.log)"
+fi
+
 # Start UI Activator daemon
 cat > /data/local/tmp/ui_activator.sh <<'UIACT'
 #!/system/bin/sh
@@ -556,12 +747,49 @@ STAGE="/data/local/tmp/lineage_stage"
 BB=$(which busybox 2>/dev/null || echo "/data/adb/ksu/bin/busybox")
 [ -x "$BB" ] || BB=$(find /data/adb /system /data -name busybox 2>/dev/null | head -n 1)
 
+flag() {
+    _v=$(cat "$STAGE/$1" 2>/dev/null | tr -d ' \t\r\n')
+    if [ -n "$_v" ]; then echo "$_v"; else echo "$2"; fi
+}
+is_off() { case "$1" in 0|off|false|no|disable|disabled) return 0 ;; esac; return 1; }
+gx() { $BB nsenter -t "$PID" -m "$@"; }
+
+# Work that should land as early as possible in the guest boot, retried on
+# every 2 s poll until it sticks (untested on device).
+#
+# GMS SafetyCenter: the host's Android 17 GMS crash-loops in the guest every
+# ~5 s on "IllegalArgumentException: Unexpected safety source:
+# AdvancedProtection" from SafetyCenterManager.setSafetySourceData. In the
+# Android 16 SafetyCenterService, setSafetySourceData returns early when the
+# Safety Center API is disabled, BEFORE it validates the source id, and the
+# privacy/safety_center_is_enabled DeviceConfig flag still overrides the U+
+# default of "enabled". The old code set the flag once, ~45 s into boot, after
+# the loop had been running for a while, and GMS's own flag sync can set it
+# back to true. Now: set it as soon as the settings provider answers, freeze
+# DeviceConfig sync so GMS cannot undo it, and read it back.
+# Toggle: echo 0 > $STAGE/gms_safety_fix
+SAFETY_DONE=0
+early_tweaks() {
+    if [ "$SAFETY_DONE" = 0 ]; then
+        if is_off "$(flag gms_safety_fix on)"; then
+            SAFETY_DONE=1
+        elif gx /system/bin/device_config put privacy safety_center_is_enabled false >/dev/null 2>&1; then
+            gx /system/bin/device_config set_sync_disabled_for_tests persistent >/dev/null 2>&1
+            if [ "$(gx /system/bin/device_config get privacy safety_center_is_enabled 2>/dev/null)" = "false" ]; then
+                SAFETY_DONE=1
+                echo "[UI Activator] SafetyCenter API disabled for GMS (sync mode: $(gx /system/bin/device_config get_sync_disabled_for_tests 2>/dev/null))"
+            fi
+        fi
+    fi
+}
+
 ready_count=0
 while true; do
     sleep 2
     PID=$(pidof system_server | awk '{print $1}')
     if [ -n "$PID" ]; then
         echo "[UI Activator] system_server PID=$PID alive, checking readiness..."
+        early_tweaks
         is_ready=0
         if $BB nsenter -t $PID -m /system/bin/dumpsys window 2>/dev/null | grep -E -q 'mStatusBar|StatusBar'; then
             echo "[UI Activator] StatusBar found in WindowManager!"
@@ -597,9 +825,10 @@ while true; do
             LDENS=$(cat "$STAGE/density" 2>/dev/null | tr -dc '0-9')
             [ -n "$LDENS" ] || LDENS=540
             $BB nsenter -t $PID -m /system/bin/wm density "$LDENS" 2>/dev/null || true
-            # GMS from the host is Android 17 and crash-loops against Android 16's
-            # SafetyCenter, JIT-compiling from scratch every ~5 s (the 100C heat).
-            $BB nsenter -t $PID -m /system/bin/device_config put privacy safety_center_is_enabled false 2>/dev/null || true
+            # GMS SafetyCenter crash loop: see early_tweaks above (retried here in
+            # case the settings provider was not up during the early polls).
+            early_tweaks
+            [ "$SAFETY_DONE" = 1 ] || echo "[UI Activator] WARNING: could not disable the SafetyCenter API yet"
             # Keep adb on and never auto-revoke authorisations
             $BB nsenter -t $PID -m /system/bin/settings put global adb_enabled 1 2>/dev/null || true
             $BB nsenter -t $PID -m /system/bin/settings put global adb_allowed_connection_time 0 2>/dev/null || true
@@ -608,8 +837,30 @@ while true; do
             $BB nsenter -t $PID -m /system/bin/settings put global stay_on_while_plugged_in 7
             $BB nsenter -t $PID -m /system/bin/settings put system screen_off_timeout 2147483647
             $BB nsenter -t $PID -m /system/bin/settings put system haptic_feedback_enabled 1
-            $BB nsenter -t $PID -m /system/bin/settings put system peak_refresh_rate 120.0
-            $BB nsenter -t $PID -m /system/bin/settings put system min_refresh_rate 120.0
+            # Refresh rate. min_refresh_rate used to be forced to 120, which keeps
+            # the panel, SurfaceFlinger and the GPU at 120 Hz even on a static
+            # screen that never turns off (stayon above): steady heat for no
+            # benefit. Let it idle down to 60 Hz; scrolling still runs at the peak.
+            # Toggle: echo 120 > $STAGE/min_refresh (old behaviour), and
+            #         $STAGE/peak_refresh for the upper bound (default 120).
+            $BB nsenter -t $PID -m /system/bin/settings put system peak_refresh_rate "$(flag peak_refresh 120.0)"
+            $BB nsenter -t $PID -m /system/bin/settings put system min_refresh_rate "$(flag min_refresh 60.0)"
+            # Cached-app freezer. Only meaningful when the guest can see the
+            # cgroup v2 tree (opt-in guest_cgroups, see master_prepare.sh).
+            case "$(flag guest_cgroups 0)" in
+                1|on|true|yes)
+                    $BB nsenter -t $PID -m /system/bin/settings put global cached_apps_freezer enabled 2>/dev/null || true
+                    $BB nsenter -t $PID -m /system/bin/device_config put activity_manager_native_boot use_freezer true 2>/dev/null || true
+                    echo "[UI Activator] cached-app freezer enabled (guest_cgroups=1)"
+                    ;;
+            esac
+            # Background dexopt in the guest is wasted work (see the dexopt
+            # throttle in switch_to_lineage.sh); cancel anything already queued.
+            if ! is_off "$(flag dexopt_throttle on)"; then
+                # (Not "bg-dexopt-job --cancel": builds without that flag would
+                # treat it as a package list and START the job.)
+                $BB nsenter -t $PID -m /system/bin/pm cancel-bg-dexopt-job >/dev/null 2>&1 || true
+            fi
             $BB nsenter -t $PID -m /system/bin/cmd overlay enable-exclusive --category com.android.internal.systemui.navbar.gestural 2>/dev/null || true
             $BB nsenter -t $PID -m /system/bin/settings put secure navigation_mode 2 2>/dev/null || true
             $BB nsenter -t $PID -m /system/bin/pm disable android.ext.services/android.ext.services.notification.Assistant 2>/dev/null || true

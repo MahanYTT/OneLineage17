@@ -21,6 +21,17 @@ if [ -f /data/local/tmp/lineage_stage/thermal_cpufreq.saved ]; then
     rm -f /data/local/tmp/lineage_stage/thermal_cpufreq.saved
     echo "Restored cpufreq limits capped by the thermal guard"
 fi
+pkill -9 -f "crashloop_guard.sh" 2>/dev/null || true
+# Host properties that switch_to_lineage.sh changed for the session (dexopt
+# throttle, adb tcp port, ...): put the originals back before One UI's
+# system_server reads them.
+if [ -f /data/local/tmp/lineage_stage/saved_props ]; then
+    while IFS='=' read -r k v; do
+        [ -n "$k" ] && setprop "$k" "$v" 2>/dev/null
+    done < /data/local/tmp/lineage_stage/saved_props
+    rm -f /data/local/tmp/lineage_stage/saved_props
+    echo "Restored host properties changed for the Lineage session"
+fi
 # Stop the suppressors started by switch_to_lineage.sh so One UI's own
 # media.codec and rescue_boot_count handling is restored.
 pkill -9 -f "media_codec_suppress" 2>/dev/null || true

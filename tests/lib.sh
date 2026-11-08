@@ -8,7 +8,8 @@ TEST_SH=${TEST_SH:-mksh}
 if [ "$TEST_SH" = busybox ]; then
     # busybox needs "busybox sh"; wrap it so "$TEST_SH" stays one word.
     _bb=$(mktemp "${TMPDIR:-/tmp}/bbsh.XXXXXX")
-    printf '#!/bin/sh\nexec busybox sh "$@"\n' > "$_bb"
+    # absolute path: tests put a fake "busybox" (nsenter stub) first on PATH
+    printf '#!/bin/sh\nexec %s sh "$@"\n' "$(command -v busybox)" > "$_bb"
     chmod +x "$_bb"
     TEST_SH=$_bb
 fi

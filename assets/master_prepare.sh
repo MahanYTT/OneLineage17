@@ -59,6 +59,23 @@ echo "=== 4. Setting up Core System Bind Mounts ==="
 mount | grep -q "$ROOTFS/proc " || $BB mount -t proc proc "$ROOTFS/proc"
 mount | grep -q "$ROOTFS/sys " || $BB mount -t sysfs sysfs "$ROOTFS/sys"
 
+# Opt-in, untested on device: give the guest the host's cgroup v2 tree.
+# A fresh sysfs mount has an EMPTY /sys/fs/cgroup (submounts are not carried
+# over), while the guest's libprocessgroup reads the host init's
+# /dev/cgroup_info/cgroup.rc (via the /dev rbind) and expects the cgroup2
+# hierarchy there. Without it the cached-app freezer cannot work and
+# background task profiles probably fail, i.e. background apps are never
+# throttled. Default off because it changes how every guest process is
+# scheduled. Enable: echo 1 > $STAGE/guest_cgroups (ui_activator then also
+# turns on the cached-app freezer).
+case "$(cat "$STAGE/guest_cgroups" 2>/dev/null | tr -d ' \t\r\n')" in
+    1|on|true|yes)
+        if mount | grep -q " /sys/fs/cgroup " && ! mount | grep -q "$ROOTFS/sys/fs/cgroup "; then
+            $BB mount --bind /sys/fs/cgroup "$ROOTFS/sys/fs/cgroup" && echo "Bound host /sys/fs/cgroup into the guest (guest_cgroups=1)"
+        fi
+        ;;
+esac
+
 if [ ! -e /dev/binderfs/binder ]; then
     mount -t binder binder /dev/binderfs 2>/dev/null || true
     chmod 666 /dev/binderfs/binder /dev/binderfs/hwbinder /dev/binderfs/vndbinder 2>/dev/null || true
@@ -562,25 +579,49 @@ cat > "$STAGE/data/local/tmp/app_storage_loop.sh" <<'APPLOOP'
 #!/system/bin/sh
 # Watches for installs/removals, gives the new package its data dirs, and makes
 # the launcher re-query so the app actually shows up.
+#
+# Heat fix (untested on device): ensure_app_storage.sh used to run every 10 s.
+# For every package (~300 with the owner's ~200 apps) it spawns `stat` for up
+# to 5 directories, i.e. ~1500 fork+exec every 10 s, all session long, roughly
+# 15-30 % of a core for nothing. Everything it fixes is caused by an install,
+# removal or reinstall, and all of those change packages.list. So: run it when
+# packages.list changes, plus a full sweep every storage_sweep_full loops
+# (default 30 = 5 min) as a safety net.
+# Toggle: echo 1 > $STAGE/storage_sweep_full   (sweep every 10 s, old behaviour)
+FLAGS=${LINEAGE_FLAGS:-/data/local/tmp/lineage_flags}
+STORAGE_SCRIPT=${ENSURE_APP_STORAGE:-/data/local/tmp/ensure_app_storage.sh}
+NET_SCRIPT=${NET_FIX:-/data/local/tmp/net_fix.sh}
+PKG_LIST=${PACKAGES_LIST:-/data/system/packages.list}
+APP_LOG=${APP_STORAGE_LOG:-/data/app_storage.log}
+LOOP_SLEEP=${APP_LOOP_SLEEP:-10}
+LOOP_MAX=${APP_LOOP_MAX:-0}
+full=$(cat "$FLAGS/storage_sweep_full" 2>/dev/null | tr -dc '0-9')
+[ -n "$full" ] && [ "$full" -gt 0 ] || full=30
 last=""
+n=0
 while true; do
-    sleep 10
+    sleep "$LOOP_SLEEP"
     case "$(getprop sys.boot_completed)" in 1) ;; *) continue ;; esac
-    netout=$(/system/bin/sh /data/local/tmp/net_fix.sh 2>/dev/null)
-    [ -n "$netout" ] && echo "$(date) $netout" >> /data/app_storage.log
-    cur=$(md5sum /data/system/packages.list 2>/dev/null | cut -d' ' -f1)
-    out=$(/system/bin/sh /data/local/tmp/ensure_app_storage.sh 2>/dev/null)
+    n=$((n + 1))
+    netout=$(/system/bin/sh "$NET_SCRIPT" 2>/dev/null)
+    [ -n "$netout" ] && echo "$(date) $netout" >> "$APP_LOG"
+    cur=$(md5sum "$PKG_LIST" 2>/dev/null | cut -d' ' -f1)
+    out=""
+    if [ "$cur" != "$last" ] || [ $((n % full)) -eq 0 ]; then
+        out=$(/system/bin/sh "$STORAGE_SCRIPT" 2>/dev/null)
+    fi
     if [ -n "$last" ] && { [ "$cur" != "$last" ] || [ -n "$out" ]; }; then
         # A package appeared or went away. LauncherApps caches the app list, so
         # something installed from Aurora or Play Store is missing from both the
         # drawer and app search until the launcher re-queries. Restarting the
         # launcher forces that and does not touch whatever app is in front.
         am force-stop com.android.launcher3 2>/dev/null
-        echo "$(date) package list changed -> launcher refreshed ${out:+($out)}" >> /data/app_storage.log
+        echo "$(date) package list changed -> launcher refreshed ${out:+($out)}" >> "$APP_LOG"
     elif [ -n "$out" ]; then
-        echo "$(date) $out" >> /data/app_storage.log
+        echo "$(date) $out" >> "$APP_LOG"
     fi
     last=$cur
+    [ "$LOOP_MAX" -gt 0 ] && [ "$n" -ge "$LOOP_MAX" ] && exit 0
 done
 APPLOOP
 chmod 755 "$STAGE/data/local/tmp/app_storage_loop.sh" 2>/dev/null || true
