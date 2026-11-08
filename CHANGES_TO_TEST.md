@@ -2,7 +2,25 @@
 
 Written for the OneLineage17 fork running on a Galaxy S26 Ultra (One UI 9 /
 Android 17), but most of it applies to any device OneLineage supports.
-None of this has run on a phone yet. Every change below was written from
+
+## Device results (2026-11-08, S26 Ultra, launched from adb as in 0.A)
+
+| Item | Result | Evidence |
+|---|---|---|
+| Thermal guard zone choice | **Fixed, verified** | `cpu-hw-trip-0/1` always read 105 C (trip points). The guard tripped 4 s after start, ran return_to_oneui.sh during master_prepare.sh, pivot_root failed, phone stuck on the Samsung boot screen. Zones matching `trip\|limit` are now skipped; Lineage boots. |
+| Heat (CPU caps) | **Verified** | One UI's SSRM is gone in Lineage; a core went 45 -> 105 C in ~30 s. Baseline 70 % cap + 50 % at 85 C for 4 s: caps read back on both policies, hottest core ~58-65 C after boot. |
+| system_server busy loop | **Fixed, verified** | `CaptureStateTracker: Audio policy service died` ~6,700 lines/s -> 0 after patching `ExternalCaptureStateTracker.run()` in services_patched.jar. |
+| Remaining CPU | Open | After boot: mediaserver ~140-170 %, system_server ~125 %, SystemUI ~120 %, media provider ~65 %, logd ~50 %. Not traced yet. A one-time `PHH-Enroll` burst (~263k lines in 1 ms) at boot. |
+| adb | **Open, main blocker** | Every adb service hangs 1-2 min after boot (even `adb reboot`), device stays listed, usb.state never changes. Hiding adbd's control socket from Lineage did not help (hung at ~100 s). Read `/data/local/tmp/adbd_threads.txt(.prev)` after the next hang. |
+| Volume-key escape | Unit-tested only | Hold Volume Up + Down 3 s -> return_to_oneui.sh. |
+| Status bar / cutout | **Open** | Guest cutout empty, status bar 95 px vs 139 px punch hole. Host spec read and converted correctly; fabricated overlays install and enable "ok", but the guest still reports no cutout, even on the next boot. |
+| Internet | Works (user report) | Wi-Fi and mobile data both work; mobile "a bit weird". |
+| Google app | Open | Crashes when anything enumerates cameras (WebView VideoCaptureFactory): `CameraMetadataNative ... Failed to read from parcel (error code -22)`. Android 17 cameraserver metadata vs Android 16 framework. |
+| GMS | Mostly OK | Crash-loops only in the first ~7 s of boot (CronetDynamite.apk writable, SafetyCenter AdvancedProtection), then stable. |
+| Shell root | Note | After every reboot or return to One UI, Shell root must be re-granted in KernelSU-Next before `adb shell su` works. |
+
+The sections below were written before any device run.
+Every change below was written from
 reading the scripts. CI checks it offline: syntax under mksh/busybox/dash,
 shellcheck, LF line endings, zygote_exec integrity, and unit tests that run the
 watchdog logic against fake sysfs/props. CI says nothing about how the phone
