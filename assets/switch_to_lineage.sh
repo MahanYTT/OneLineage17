@@ -79,6 +79,141 @@ while [ "$ims_i" -lt 45 ]; do
 done
 echo "IMS gate: voiceRegState=$ims_st after $((ims_i * 2))s, imsd=${ims_pid:-$(pidof imsd)}"
 
+# --- CONTROL TOOL ---------------------------------------------------------
+# One entry point for the owner while Lineage runs (untested on device):
+#   adb shell su -c 'sh /data/local/tmp/lineage_ctl.sh help'
+# status (temps, top CPU users, IP for adb-over-Wi-Fi, guards), flags (every
+# toggle with its value), set/unset a toggle, live density/font scale, undo
+# what the crash-loop guard or the wizard skip did, tail all logs, exit.
+cat > /data/local/tmp/lineage_ctl.sh <<'CTL'
+#!/system/bin/sh
+STAGE=${STAGE:-/data/local/tmp/lineage_stage}
+GFLAGS="$STAGE/data/local/tmp/lineage_flags"
+TZ_ROOT=${TZ_ROOT:-/sys/class/thermal}
+if [ -z "$BB" ]; then
+    BB=$(which busybox 2>/dev/null || echo "/data/adb/ksu/bin/busybox")
+    [ -x "$BB" ] || BB=$(find /data/adb /system /data -name busybox 2>/dev/null | head -n 1)
+fi
+
+# name|default|meaning   (keep in sync with CHANGES_TO_TEST.md)
+FLAGS_TABLE='thermal_guard|on|thermal safety valve: on, log (dry run) or 0
+thermal_soft_c|85|C at which CPUs get capped (after 20 s)
+thermal_softcap_pct|70|cap in % of max frequency, 0 = never cap
+thermal_trip_c|95|C at which Lineage is exited
+thermal_trip_secs|30|seconds above thermal_trip_c before exiting
+thermal_batt_c|47|battery C that exits Lineage after 60 s
+thermal_zones|(cpu/gpu/nsp...)|grep -E regex of zone types to watch
+crashloop_guard|on|disable crash-looping apps in the guest: on, log or 0
+crashloop_limit|5|crashes ...
+crashloop_window_s|180|... within this many seconds
+dexopt_throttle|on|no background dexopt, fewer dex2oat threads
+gms_safety_fix|on|disable SafetyCenter API so host GMS stops crash-looping
+skip_setup|on|mark provisioned and disable setup wizards
+min_refresh|60.0|minimum refresh rate (Hz)
+peak_refresh|120.0|peak refresh rate (Hz)
+guest_cgroups|0|opt-in: give the guest cgroup v2 + app freezer (next boot)
+storage_sweep_full|30|full app-storage sweep every N x 10 s
+dns_heal|on|repair DNS for the current network when names fail
+dns_servers|(network)|force resolvers, comma separated
+net_bounce|0|allow toggling Wi-Fi as a last-resort DNS fix
+density|540|guest display density (dpi)
+font_scale|(unset)|guest font scale, e.g. 0.9
+adb_tcp|0|adb over Wi-Fi port (e.g. 5555), next Switch
+adb_watchdog_interval|1|seconds between adb watchdog checks'
+
+guest_pid() {
+    for p in $(pidof system_server 2>/dev/null); do
+        ns=$(readlink "/proc/$p/ns/mnt" 2>/dev/null)
+        [ -n "$ns" ] && [ "$ns" != "$(readlink /proc/self/ns/mnt)" ] && { echo "$p"; return 0; }
+    done
+    return 1
+}
+gx() {
+    pid=$(guest_pid) || { echo "Lineage is not running (no guest system_server)" >&2; return 1; }
+    "$BB" nsenter -t "$pid" -m "$@"
+}
+setflag() {
+    echo "$2" > "$STAGE/$1"
+    [ -d "$GFLAGS" ] && echo "$2" > "$GFLAGS/$1" && chmod 644 "$GFLAGS/$1" 2>/dev/null
+    echo "$1 = $2"
+}
+
+temps() {
+    for z in "$TZ_ROOT"/thermal_zone*; do
+        read -r t < "$z/type" 2>/dev/null || continue
+        read -r v < "$z/temp" 2>/dev/null || continue
+        case "$v" in ''|*[!0-9]*) continue ;; esac
+        [ "$v" -ge 1000 ] && v=$((v / 1000))
+        echo "$v $t"
+    done | sort -rn | head -n "${1:-8}"
+}
+
+case "$1" in
+    status|"")
+        echo "== temperatures (hottest zones, C)"; temps 8 | sed 's/^/  /'
+        b=$(cat /sys/class/power_supply/battery/temp 2>/dev/null); [ -n "$b" ] && echo "  battery: $((b / 10)).$((b % 10)) C"
+        echo "== guards"
+        for d in thermal_guard crashloop_guard adb_watchdog app_storage_loop; do
+            if pgrep -f "$d.sh" >/dev/null 2>&1; then echo "  $d: running"; else echo "  $d: not running"; fi
+        done
+        [ -f "$STAGE/thermal_tripped" ] && echo "  LAST THERMAL TRIP: $(cat "$STAGE/thermal_tripped")"
+        [ -f "$STAGE/thermal_cpufreq.saved" ] && echo "  CPUs are CAPPED by the thermal guard"
+        for p in /sys/devices/system/cpu/cpufreq/policy*; do
+            [ -r "$p/scaling_max_freq" ] && echo "  $(basename "$p"): max $(cat "$p/scaling_max_freq") / hw $(cat "$p/cpuinfo_max_freq")"
+        done
+        [ -s "$STAGE/crashloop_disabled.txt" ] && echo "  disabled by crash-loop guard: $(tr '\n' ' ' < "$STAGE/crashloop_disabled.txt")"
+        echo "== network / adb"
+        ip -4 addr show wlan0 2>/dev/null | awk '/inet /{print "  wlan0 " $2}'
+        echo "  usb: config=$(getprop sys.usb.config) state=$(getprop sys.usb.state) adbd=$(getprop init.svc.adbd) tcp=$(getprop service.adb.tcp.port)"
+        echo "== top CPU users"; top -b -n 1 -m 12 2>/dev/null | sed 's/^/  /'
+        ;;
+    temps) temps 40 ;;
+    flags)
+        echo "$FLAGS_TABLE" | while IFS='|' read -r n d m; do
+            v=$(cat "$STAGE/$n" 2>/dev/null | tr -d '\r\n')
+            printf '  %-22s %-12s (default %s) %s\n' "$n" "${v:--}" "$d" "$m"
+        done ;;
+    set) [ -n "$2" ] && [ -n "$3" ] || { echo "usage: set NAME VALUE"; exit 1; }; setflag "$2" "$3"
+         echo "(read on the next Switch unless noted in 'flags'; live: density, fontscale)" ;;
+    unset) [ -n "$2" ] || exit 1; rm -f "$STAGE/$2" "$GFLAGS/$2"; echo "$2 back to default" ;;
+    density) [ -n "$2" ] || { gx /system/bin/wm density; exit; }; setflag density "$2"; gx /system/bin/wm density "$2" ;;
+    fontscale) [ -n "$2" ] || exit 1; setflag font_scale "$2"; gx /system/bin/settings put system font_scale "$2" ;;
+    crashloop-list) cat "$STAGE/crashloop_disabled.txt" 2>/dev/null || echo "(none)" ;;
+    crashloop-undo)
+        while read -r pkg; do
+            [ -n "$pkg" ] && gx /system/bin/pm enable --user 0 "$pkg" >/dev/null 2>&1 && echo "re-enabled $pkg"
+        done < "$STAGE/crashloop_disabled.txt" 2>/dev/null
+        rm -f "$STAGE/crashloop_disabled.txt" ;;
+    wizard-restore)
+        setflag skip_setup 0
+        for w in com.google.android.setupwizard org.lineageos.setupwizard com.android.provision; do
+            gx /system/bin/pm enable --user 0 "$w" >/dev/null 2>&1 && echo "re-enabled $w"
+        done ;;
+    display) cat /data/local/tmp/lineage_display.txt 2>/dev/null || echo "no report yet (written 20 s after HOME)" ;;
+    logs)
+        for f in /data/local/tmp/thermal_guard.log /data/local/tmp/crashloop_guard.log \
+                 /data/local/tmp/adb_watchdog.log /data/local/tmp/ui_activator.log "$STAGE/data/app_storage.log"; do
+            echo "== $f"; tail -n "${2:-15}" "$f" 2>/dev/null
+        done ;;
+    exit) sh "$STAGE/return_to_oneui.sh" ;;
+    *)
+        echo "usage: lineage_ctl.sh <command>"
+        echo "  status                 temps, guards, CPU caps, IP, adb, top CPU users"
+        echo "  temps                  every thermal zone, hottest first"
+        echo "  flags                  every toggle with value and default"
+        echo "  set NAME VALUE | unset NAME"
+        echo "  density [N]            show or set guest density live (and keep it)"
+        echo "  fontscale X            set guest font scale live (and keep it)"
+        echo "  crashloop-list | crashloop-undo"
+        echo "  wizard-restore         re-enable the setup wizards"
+        echo "  display                show the display/cutout report"
+        echo "  logs [N]               tail every OneLineage log"
+        echo "  exit                   return to One UI"
+        ;;
+esac
+CTL
+chmod 755 /data/local/tmp/lineage_ctl.sh
+
 # --- ADB OVER WI-FI FALLBACK (opt-in, untested on device) -----------------
 # USB adb was lost twice shortly after Lineage came up. adbd also listens on
 # TCP when service.adb.tcp.port is set (what `adb tcpip 5555` does), and it
