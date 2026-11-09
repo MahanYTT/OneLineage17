@@ -1,0 +1,8 @@
+# LineageOS 24 ART module (service-art.jar) patches: artd is One UI's; its
+# cleanup/delete calls would remove One UI's compiled code and profiles.
+Lcom/android/server/art/IArtd$Stub$Proxy;:cleanup
+Lcom/android/server/art/IArtd$Stub$Proxy;:deleteArtifacts
+Lcom/android/server/art/IArtd$Stub$Proxy;:deleteProfile
+Lcom/android/server/art/IArtd$Stub$Proxy;:deleteRuntimeArtifacts
+Lcom/android/server/art/IArtd$Stub$Proxy;:deleteSdmSdcFiles
+Lcom/android/server/art/ArtManagerLocal;:cleanup

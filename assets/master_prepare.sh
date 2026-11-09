@@ -71,17 +71,27 @@ GUEST_FP=$(grep -m1 -E '^ro.(system.)?build.fingerprint=' "$ROOTFS/system/build.
 case "$GUEST_SDK" in ''|*[!0-9]*) GUEST_SDK=36 ;; esac
 LEGACY16=0; [ "$GUEST_SDK" -le 36 ] && LEGACY16=1
 echo "$GUEST_SDK" > "$STAGE/guest_sdk"
-# SAFETY STOP (2026-11-09). During a LineageOS 24 test session on an S26
-# Ultra ~186 GB were discarded on /data within minutes of Lineage's system
-# services starting, and Lineage requested a factory reset (RecoverySystem
-# "uncrypt setup bcb"). Lineage shares One UI's real /data/media and One
-# UI's installd/vold/keystore over binder, and its Android 17 framework runs
-# without the old Android 16 safety patches. Until the cause is found and
-# blocked, refuse to start an Android 17+ image.
-if [ "$LEGACY16" = 0 ] && [ ! -f "$STAGE/i_accept_data_loss_android17" ]; then
-    echo "REFUSING to start an Android $GUEST_SDK guest: it deleted user data on a test phone (see CHANGES_TO_TEST.md)."
-    $BB umount -l "$ROOTFS" 2>/dev/null
-    exit 1
+# DATA SAFETY (Android 17+ guests). On 2026-11-09 a LineageOS 24 boot on an
+# S26 Ultra logged "Destroying user 0 on volume null because we failed to
+# prepare", and One UI's installd (shared over binder) wiped the real user 0
+# app data and media. An Android 17 guest only starts with every guard in
+# place: services17_patched.jar and service-art17_patched.jar (no installd,
+# vold key/storage, keystore, recovery or artd-delete calls, see
+# tools/dexpatch/*.txt), a private /data/media, no /data bridges, read-only
+# /data/adb and /data/apex, and the host-side tripwire in
+# switch_to_lineage.sh. If the tripwire ever fired, it stays refused.
+if [ "$LEGACY16" = 0 ]; then
+    GUARD_FAIL=""
+    [ -f "$STAGE/services17_patched.jar" ] || GUARD_FAIL="$GUARD_FAIL services17_patched.jar-missing"
+    [ -f "$STAGE/service-art17_patched.jar" ] || GUARD_FAIL="$GUARD_FAIL service-art17_patched.jar-missing"
+    case "$(cat "$STAGE/services17_patch" 2>/dev/null | tr -d ' \t\r\n')" in 0|off|false|no) GUARD_FAIL="$GUARD_FAIL services17_patch-off" ;; esac
+    [ -f "$STAGE/tripwire_fired" ] && GUARD_FAIL="$GUARD_FAIL tripwire-fired($(cat "$STAGE/tripwire_fired"))"
+    if [ -n "$GUARD_FAIL" ]; then
+        echo "REFUSING to start an Android $GUEST_SDK guest, data-safety guards missing:$GUARD_FAIL"
+        $BB umount -l "$ROOTFS" 2>/dev/null
+        exit 1
+    fi
+    echo "Android $GUEST_SDK guest: data-safety guards present"
 fi
 echo "Guest image: SDK $GUEST_SDK ($GUEST_FP), Android 16 patches: $([ $LEGACY16 = 1 ] && echo on || echo off)"
 # The extracted APEX payloads (*_payload.img) belong to one image: drop them
@@ -417,7 +427,10 @@ echo "=== 5d. Bridging host /data app trees into the staged /data ==="
 # equivalents over those host paths for the duration of the session, so those
 # daemons write into the guest's data. One UI is not running meanwhile and
 # return_to_oneui.sh removes the binds again.
-for d in app app-staging user user_de dalvik-cache misc/profiles; do
+# Android 17 guests never call installd (services17_patched.jar), and these
+# binds are made in this shell's mount namespace, which One UI's installd may
+# not even see, so they protected nothing. Skipped there.
+[ "$LEGACY16" = 0 ] && echo "Android 17 guest: /data bridges skipped" || for d in app app-staging user user_de dalvik-cache misc/profiles; do
     mkdir -p "$STAGE/data/$d" 2>/dev/null || true
     if [ -d "/data/$d" ] && ! mount | grep -q " /data/$d "; then
         $BB mount --bind "$STAGE/data/$d" "/data/$d" 2>/dev/null && echo "Bridged /data/$d -> $STAGE/data/$d"
@@ -427,8 +440,21 @@ done
 mount | grep -q "$ROOTFS/data " || $BB mount --bind "$STAGE/data" "$ROOTFS/data"
 mount | grep -q "$ROOTFS/data/adb " || $BB mount --bind /data/adb "$ROOTFS/data/adb"
 mount | grep -q "$ROOTFS/data/apex " || $BB mount --bind /data/apex "$ROOTFS/data/apex"
+if [ "$LEGACY16" = 0 ]; then
+    # One UI's /data/adb (KernelSU) and /data/apex: read-only for the guest.
+    $BB mount -o remount,bind,ro "$ROOTFS/data/adb" 2>/dev/null
+    $BB mount -o remount,bind,ro "$ROOTFS/data/apex" 2>/dev/null
+fi
 mkdir -p "$ROOTFS/data/media"
-mount | grep -q "$ROOTFS/data/media " || $BB mount --bind /data/media "$ROOTFS/data/media" 2>/dev/null || true
+# Shared storage. Android 17 guests get their own ($STAGE/data/media) unless
+# share_media=1: with One UI's real /data/media bound here, anything the
+# guest deletes is deleted on the phone.
+if [ "$LEGACY16" = 0 ] && [ "$(cat "$STAGE/share_media" 2>/dev/null | tr -d ' \t\r\n')" != 1 ]; then
+    mkdir -p "$STAGE/data/media/0"
+    echo "Android 17 guest: private /data/media (share_media=1 to share One UI's)"
+else
+    mount | grep -q "$ROOTFS/data/media " || $BB mount --bind /data/media "$ROOTFS/data/media" 2>/dev/null || true
+fi
 
 echo "=== 5e. Writing per-package data-dir helper ==="
 # Apps installed before the /data bridge existed have no CE/DE data dirs in the
@@ -978,6 +1004,14 @@ fi
 if [ -d /system_ext/apex ]; then
     mkdir -p "$ROOTFS/system/system_ext/apex"
     mount | grep -q "$ROOTFS/system/system_ext/apex " || $BB mount --bind /system_ext/apex "$ROOTFS/system/system_ext/apex"
+fi
+
+if [ "$LEGACY16" = 0 ]; then
+    for a in "$ROOTFS"/apex/com.android.art "$ROOTFS"/apex/com.android.art@*; do
+        [ -f "$a/javalib/service-art.jar" ] || continue
+        $BB umount -l "$a/javalib/service-art.jar" 2>/dev/null
+        $BB mount --bind "$STAGE/service-art17_patched.jar" "$a/javalib/service-art.jar" && echo "Bound service-art17_patched.jar -> $a"
+    done
 fi
 
 echo "=== 9. Bind-mounting Remaining Non-Payload APEXes ==="

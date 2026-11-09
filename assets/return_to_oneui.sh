@@ -25,6 +25,10 @@ if [ -f /data/local/tmp/lineage_stage/thermal_cpufreq.saved ]; then
 fi
 pkill -9 -f "crashloop_guard.sh" 2>/dev/null || true
 pkill -9 -f "boot_watchdog.sh" 2>/dev/null || true
+pkill -9 -f "data_tripwire.sh" 2>/dev/null || true
+# The data tripwire freezes and stops One UI's installd when it fires.
+kill -CONT $(pidof installd) 2>/dev/null
+setprop ctl.start installd 2>/dev/null
 # Host properties that switch_to_lineage.sh changed for the session (dexopt
 # throttle, adb tcp port, ...): put the originals back before One UI's
 # system_server reads them.

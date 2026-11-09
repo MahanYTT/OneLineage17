@@ -1,0 +1,87 @@
+# LineageOS 24 (Android 17) services.jar patches. One "Class;:method[:value]"
+# per line; all overloads of a method are patched to return at once
+# (void / 0 / null / the given value). Built with:
+#   python dexpatch.py services.jar patch services17_patched.jar $(grep -v '^#' services17.txt)
+# Why: Lineage's system_server shares One UI's installd, vold, keystore2,
+# Weaver and recovery over binder. On 2026-11-09 a LineageOS 24 boot logged
+# "Destroying user 0 on volume null because we failed to prepare" and One
+# UI's installd wiped the real user 0 app data and media of the test phone.
+# Every call below acts on the REAL phone and must never run from Lineage.
+#
+# Lock settings / keystore / Weaver / CE keys (One UI's)
+Lcom/android/server/locksettings/LockSettingsService;:setCeStorageProtection
+Lcom/android/server/locksettings/LockSettingsService;:isWeaverDisabledOnUnsecuredUsers:1
+Lcom/android/server/locksettings/SyntheticPasswordManager;:isWeaverDisabledOnUnsecuredUsers:1
+Lcom/android/server/locksettings/SyntheticPasswordManager;:getWeaverService
+Lcom/android/server/locksettings/SyntheticPasswordManager;:getWeaverServiceLocked
+Lcom/android/server/locksettings/LockSettingsService;:initKeystoreSuperKeys
+Lcom/android/server/locksettings/LockSettingsService;:lockKeystore
+Lcom/android/server/locksettings/LockSettingsService;:unlockKeystore
+Lcom/android/server/locksettings/LockSettingsService;:resetKeyStore
+Lcom/android/server/locksettings/LockSettingsService;:unlockCeStorage
+Lcom/android/server/locksettings/LockSettingsService;:isCeStorageUnlocked:1
+Lcom/android/server/StorageManagerService;:isCeStorageUnlocked:1
+Lcom/android/server/StorageManagerService;:lockCeStorage
+# installd (One UI's): isolated mode, plus every destructive call explicitly
+Lcom/android/server/pm/Installer;:checkBeforeRemote:0
+Lcom/android/server/pm/Installer;:destroyAppData
+Lcom/android/server/pm/Installer;:destroyUserData
+Lcom/android/server/pm/Installer;:clearAppData
+Lcom/android/server/pm/Installer;:destroyAppDataSnapshot
+Lcom/android/server/pm/Installer;:destroyCeSnapshotsNotSpecified
+Lcom/android/server/pm/Installer;:destroyPccData
+Lcom/android/server/pm/Installer;:rmPackageDir
+Lcom/android/server/pm/Installer;:cleanupInvalidPackageDirs
+Lcom/android/server/pm/Installer;:freeCache
+Lcom/android/server/pm/Installer;:moveCompleteApp
+Lcom/android/server/pm/Installer;:migrateAppData
+Lcom/android/server/pm/Installer;:fixupAppData
+Lcom/android/server/pm/Installer;:moveAppDataPath
+Lcom/android/server/pm/Installer;:copyAppDataPath
+Lcom/android/server/pm/Installer;:onPrivateVolumeRemoved
+Lcom/android/server/pm/Installer;:restoreAppDataSnapshot
+Lcom/android/server/pm/Installer;:snapshotAppData
+Lcom/android/server/pm/Installer;:migrateLegacyObbData
+Lcom/android/server/pm/Installer;:createUserData
+Lcom/android/server/pm/Installer;:reconcileSdkData
+Lcom/android/server/pm/Installer;:tryMountDataMirror
+Lcom/android/server/pm/Installer;:invalidateMounts
+Lcom/android/server/pm/Installer;:setAppQuota
+Lcom/android/server/pm/Installer;:linkFile
+Lcom/android/server/pm/Installer;:linkNativeLibraryDirectory
+Lcom/android/server/pm/Installer;:createOatDirs
+# user data / storage (One UI's vold)
+Lcom/android/server/pm/UserDataPreparer;:destroyUserData
+Lcom/android/server/pm/UserDataPreparer;:destroyUserDataLI
+Lcom/android/server/pm/UserDataPreparer;:reconcileUsers
+Lcom/android/server/pm/UserDataPreparer;:enforceSerialNumber
+Lcom/android/server/StorageManagerService$StorageManagerInternalImpl;:destroyUserStorage
+Lcom/android/server/StorageManagerService$StorageManagerInternalImpl;:destroyUserStorageKeys
+Lcom/android/server/StorageManagerService$StorageManagerInternalImpl;:prepareUserStorage
+Lcom/android/server/StorageManagerService$StorageManagerInternalImpl;:createUserStorageKeys
+Lcom/android/server/StorageManagerService;:fixupAppDir
+Lcom/android/server/StorageManagerService;:mkdirs
+Lcom/android/server/StorageManagerService;:format
+Lcom/android/server/StorageManagerService;:partitionMixed
+Lcom/android/server/StorageManagerService;:partitionPrivate
+Lcom/android/server/StorageManagerService;:partitionPublic
+Lcom/android/server/StorageManagerService;:forgetAllVolumes
+Lcom/android/server/StorageManagerService;:forgetVolume
+Lcom/android/server/StorageManagerService;:forgetPartition
+Lcom/android/server/StorageManagerService;:benchmark
+# recovery / factory reset (would reboot the real phone into a wipe)
+Lcom/android/server/recoverysystem/RecoverySystemService;:setupBcb:0
+Lcom/android/server/recoverysystem/RecoverySystemService;:setupOrClearBcb:0
+Lcom/android/server/recoverysystem/RecoverySystemService;:uncrypt:0
+Lcom/android/server/recoverysystem/RecoverySystemService;:clearBcb:0
+Lcom/android/server/recoverysystem/RecoverySystemService;:rebootRecoveryWithCommand
+Lcom/android/server/recoverysystem/RecoverySystemService;:rebootWithLskf:1
+Lcom/android/server/recoverysystem/RecoverySystemService;:rebootWithLskfAssumeSlotSwitch:1
+Lcom/android/server/recoverysystem/RecoverySystemService;:rebootWithLskfImpl:1
+Lcom/android/server/recoverysystem/RecoverySystemService;:deleteSecrets
+Lcom/android/server/recoverysystem/RecoverySystemService;:allocateSpaceForUpdate:0
+Lcom/android/server/devicepolicy/FactoryResetter;:factoryReset:0
+Lcom/android/server/devicepolicy/FactoryResetter;:factoryResetInternalUnchecked
+Lcom/android/server/MasterClearReceiver;:onReceive
+Lcom/android/server/MasterClearReceiver;:wipeUser:0
+Lcom/android/server/devicepolicy/DevicePolicyManagerService;:wipeDataNoLock

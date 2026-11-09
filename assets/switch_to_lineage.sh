@@ -121,6 +121,7 @@ netd_restart|auto|Android 17 images: restart netd at switch and return
 services17_patch|on|Android 17 images: patched services.jar (no vold key changes, no Weaver)
 guest_fake_frp|on|private zeroed FRP partition for Lineage (protects One UI FRP)
 boot_watchdog|240|seconds until a stuck boot returns to One UI (0 = off)
+data_tripwire|on|kill Lineage if One UI user data starts disappearing
 storage_sweep_full|30|full app-storage sweep every N x 10 s
 dns_heal|on|repair DNS for the current network when names fail
 dns_servers|(network)|force resolvers, comma separated
@@ -1151,6 +1152,57 @@ if [ "${START_CRASHLOOP_GUARD:-0}" = 1 ]; then
         nohup /system/bin/sh /data/local/tmp/crashloop_guard.sh </dev/null >/dev/null 2>&1 &
     fi
     echo "crash-loop guard started (log: /data/local/tmp/crashloop_guard.log)"
+fi
+
+# Data tripwire. Lineage shares One UI's daemons over binder; on 2026-11-09
+# a LineageOS 24 boot made One UI's installd destroy the real user 0 data.
+# The framework patches (tools/dexpatch) are meant to make that impossible;
+# this is the last line: canaries in the real /data/user/0, /data/user_de/0
+# and /data/media/0, and the number of app folders in /data/user/0, checked
+# every second. If a canary vanishes or the count drops, freeze One UI's
+# installd (stops a deletion mid-way), kill every Lineage process, and leave
+# $STAGE/tripwire_fired so master_prepare.sh refuses the next start.
+# return_to_oneui.sh restarts installd. Off: echo 0 > $STAGE/data_tripwire
+pkill -9 -f "data_tripwire.sh" 2>/dev/null || true
+if is_off "$(flag data_tripwire on)"; then
+    echo "data tripwire disabled (flag)"
+else
+    for c in /data/user/0 /data/user_de/0 /data/media/0; do
+        echo "OneLineage canary, do not delete" > "$c/.onelineage_canary" 2>/dev/null
+    done
+    cat > /data/local/tmp/data_tripwire.sh <<'TRIPWIRE_SH'
+#!/system/bin/sh
+STAGE=/data/local/tmp/lineage_stage
+LOG=/data/local/tmp/data_tripwire.log
+base=$(ls /data/user/0 | wc -l)
+echo "$(date) tripwire armed: /data/user/0 has $base entries" > "$LOG"
+while true; do
+    why=""
+    for c in /data/user/0 /data/user_de/0 /data/media/0; do
+        [ -f "$c/.onelineage_canary" ] || why="$why canary-gone:$c"
+    done
+    n=$(ls /data/user/0 | wc -l)
+    [ "$n" -lt $((base - 3)) ] && why="$why user0-count:$base->$n"
+    if [ -n "$why" ]; then
+        kill -STOP $(pidof installd) 2>/dev/null
+        setprop ctl.stop installd 2>/dev/null
+        P=$(pidof system_server)
+        NS=$(readlink /proc/$P/ns/mnt 2>/dev/null)
+        kill -9 $P $(pidof zygote64) 2>/dev/null
+        if [ -n "$NS" ]; then
+            for d in /proc/[0-9]*; do
+                [ "$(readlink $d/ns/mnt 2>/dev/null)" = "$NS" ] && kill -9 ${d#/proc/} 2>/dev/null
+            done
+        fi
+        echo "$(date) TRIPPED:$why" >> "$LOG"
+        echo "$(date):$why" > "$STAGE/tripwire_fired"
+        exit 1
+    fi
+    sleep 1
+done
+TRIPWIRE_SH
+    nohup /system/bin/sh /data/local/tmp/data_tripwire.sh </dev/null >/dev/null 2>&1 &
+    echo "data tripwire armed (log: /data/local/tmp/data_tripwire.log)"
 fi
 
 # Boot watchdog. A boot that never gets to an unlocked user (stuck boot

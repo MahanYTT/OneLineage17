@@ -5,7 +5,14 @@ Android 17), but most of it applies to any device OneLineage supports.
 
 ## WARNING: LineageOS 24 (Android 17) deleted user data
 
-On 2026-11-09, during a LineageOS 24 boot test, about 186 GB were discarded on the phone /data within minutes of Lineage system services starting, and Lineage requested a factory reset (RecoverySystem wrote the BCB; the phone rebooted into the recovery wipe prompt; "Try again" was chosen, so recovery did not wipe). Most user files were gone afterwards. Cause not proven yet. Candidates: Lineage shares One UI real /data/media, and its system_server uses One UI installd, vold and keystore over binder, so package-manager clean-up or the factory-reset flow acts on the real phone. master_prepare.sh now refuses Android 17+ images. **Do not run them.**
+**Cause (proven from the session log):** at boot Lineage logged `PackageManager: Destroying user 0 on volume null because we failed to prepare` (twice), plus 194 `Failed to create app data ... but trying to recover`. Lineage's system_server uses **One UI's installd** (pid 2532 in the io_stats lines, the process doing the reads and ~186 GB of discards), so `UserDataPreparer.destroyUserDataLI` -> `installd.destroyUserData(0)` wiped the real user 0 app data (/data/user/0, /data/user_de/0) and media (/data/media/0). Lineage then asked for a factory reset (RecoverySystemService wrote the BCB). The /data "bridge" binds were meant to point installd at Lineage's folders, but they are made from a KernelSU shell, whose mount namespace One UI's installd may not share.
+
+**Guards now required for any Android 17 guest** (master_prepare.sh refuses to start otherwise):
+- services17_patched.jar (tools/dexpatch/services17.txt, 74 patch points): Installer isolated (no installd calls at all), no user/storage destroy, no vold key/storage prepare, no keystore super-key or Weaver use, no FRP writes, no recovery/BCB/factory reset.
+- service-art17_patched.jar (tools/dexpatch/service-art17.txt): no artd cleanup/delete calls.
+- Private /data/media for the guest (share_media=1 to opt in), no /data bridges, read-only /data/adb and /data/apex.
+- Data tripwire (switch_to_lineage.sh): canaries in the real /data/user/0, /data/user_de/0, /data/media/0 and the /data/user/0 entry count, checked every second; on a hit it freezes installd, kills Lineage and blocks further starts ($STAGE/tripwire_fired).
+Verified offline: both jars pass dex2oat verification; tripwire dry run trips ~1 s after a canary is removed; master_prepare refuses with a guard missing.
 
 ## Device results (2026-11-08, S26 Ultra, launched from adb as in 0.A)
 
