@@ -72,11 +72,20 @@ echo "=== [3/5] Unmounting Container Overlays ==="
 # unmounts One UI's APEX too (apexd fails, init reboots the phone with
 # "reboot,apexd-failed").
 mount --make-rprivate /data/local/tmp/lineage_stage/rootfs 2>/dev/null || true
-umount -l /data/local/tmp/lineage_stage/rootfs/* 2>/dev/null || true
-umount -l /data/local/tmp/lineage_stage/rootfs/apex/* 2>/dev/null || true
-while mount | grep -q "/data/local/tmp/lineage_stage/rootfs"; do
-    umount -l /data/local/tmp/lineage_stage/rootfs 2>/dev/null || true
-    sleep 0.1
+# Unmount only real mount points under the rootfs, deepest first. Never
+# glob it: the image's /system_ext and /product are absolute symlinks
+# (-> /system/system_ext ...), umount follows them, and
+# "umount -l rootfs/*" unmounted One UI's own /system_ext and /product. One
+# UI's system_server then crash-looped ("vendor.qti.hardware.trustedui-V1-ndk.so
+# not found") until bootchecker rebooted the phone
+# (rescueparty_by_bootchecker R2); reproduced on an S26 Ultra.
+ROOTFS_DIR=/data/local/tmp/lineage_stage/rootfs
+n=0
+while [ $n -lt 20 ]; do
+    MPS=$(awk -v r="$ROOTFS_DIR" '$2 == r || index($2, r "/") == 1 { print $2 }' /proc/mounts | sort -r)
+    [ -z "$MPS" ] && break
+    for m in $MPS; do umount -l "$m" 2>/dev/null; done
+    n=$((n + 1))
 done
 BB=$(which busybox 2>/dev/null || echo /data/adb/ksu/bin/busybox)
 if [ -x "$BB" ]; then
@@ -128,11 +137,11 @@ fi
 # wipe app data. The switch's rescue_boot_suppress loop (stopped above) did
 # this during the session; this one ends once dev.bootcomplete has been 1
 # for a minute, or after 10 minutes.
-setprop sys.rescue_boot_count 0 2>/dev/null
+setprop sys.rescue_boot_count 0 2>/dev/null; setprop crashrecovery.rescue_boot_count 0 2>/dev/null
 nohup sh -c ': rescue_boot_settle
 t=0; ok=0
 while [ $t -lt 600 ] && [ $ok -lt 60 ]; do
-    setprop sys.rescue_boot_count 0 2>/dev/null
+    setprop sys.rescue_boot_count 0 2>/dev/null; setprop crashrecovery.rescue_boot_count 0 2>/dev/null
     [ "$(getprop dev.bootcomplete)" = 1 ] && ok=$((ok + 5))
     sleep 5; t=$((t + 5))
 done' </dev/null >/dev/null 2>&1 &

@@ -881,6 +881,7 @@ set_prop ro.control_privapp_permissions log
 echo "=== [1/6] Protecting OneUI Home Screen and Disabling RescueParty ==="
 set_prop persist.sys.disable_rescue true
 set_prop sys.rescue_boot_count 0
+set_prop crashrecovery.rescue_boot_count 0
 # Periodically reset the rescue boot counter. Samsung's init increments it on
 # every zygote crash, and RescueParty triggers a factory-reset prompt (or an
 # automatic reboot on some builds) once it reaches 5. The guest's system_server
@@ -889,7 +890,7 @@ set_prop sys.rescue_boot_count 0
 if ! ps -ef 2>/dev/null | grep -v grep | grep -q ": rescue_boot_suppress"; then
     nohup $BB sh -c ": rescue_boot_suppress
 while true; do
-    setprop sys.rescue_boot_count 0 2>/dev/null
+    setprop sys.rescue_boot_count 0 2>/dev/null; setprop crashrecovery.rescue_boot_count 0 2>/dev/null
     sleep 15
 done
 " </dev/null >/dev/null 2>&1 &

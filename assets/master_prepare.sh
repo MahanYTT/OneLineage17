@@ -206,6 +206,10 @@ fi
 #   - no Weaver (getWeaverService* = null, isWeaverDisabledOnUnsecuredUsers =
 #     true): Lineage enrolled its synthetic password into hardware Weaver
 #     slot 0, which belongs to One UI.
+#   - initKeystoreSuperKeys, lockKeystore, unlockKeystore and resetKeyStore
+#     are no-ops: they act on keystore2's user 0 super keys, which are One
+#     UI's ("Failed to initialize Keystore super keys for user 0"; resetting
+#     them would invalidate One UI's auth-bound keys).
 # Off: echo 0 > $STAGE/services17_patch
 if [ "$LEGACY16" = 0 ] && [ -f "$STAGE/services17_patched.jar" ]; then
     case "$(cat "$STAGE/services17_patch" 2>/dev/null | tr -d ' \t\r\n')" in
