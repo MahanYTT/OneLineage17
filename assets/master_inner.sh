@@ -156,6 +156,12 @@ case "$(cat /data/local/tmp/lineage_flags/adb_framework_block 2>/dev/null | tr -
         fi ;;
 esac
 
+# Fake FRP partition (guest_fake_frp in master_prepare.sh): ueventd may have
+# reset the loop node to root:root after it was bound; system_server opens it
+# as uid system ("EACCES" otherwise).
+FRP_NODE=$(readlink -f "$(getprop ro.frp.pst)" 2>/dev/null)
+[ -b "$FRP_NODE" ] && chown 1000:1000 "$FRP_NODE" 2>/dev/null && chmod 600 "$FRP_NODE" 2>/dev/null
+
 # Android 17+ images (e.g. LineageOS 24): zygote_exec has the Android 16
 # class paths compiled in, which do not match a newer image. Ask the image
 # itself (derive_classpath reads the classpath fragments of /system and every

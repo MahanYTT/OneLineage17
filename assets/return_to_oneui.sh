@@ -24,6 +24,7 @@ if [ -f /data/local/tmp/lineage_stage/thermal_cpufreq.saved ]; then
     echo "Restored cpufreq limits capped by the thermal guard"
 fi
 pkill -9 -f "crashloop_guard.sh" 2>/dev/null || true
+pkill -9 -f "boot_watchdog.sh" 2>/dev/null || true
 # Host properties that switch_to_lineage.sh changed for the session (dexopt
 # throttle, adb tcp port, ...): put the originals back before One UI's
 # system_server reads them.
@@ -120,6 +121,21 @@ if [ "$(cat /data/local/tmp/lineage_stage/guest_sdk 2>/dev/null || echo 36)" -ge
         *) setprop ctl.restart netd 2>/dev/null; sleep 1; echo "netd restarted for One UI" ;;
     esac
 fi
+# Keep Samsung's rescue counter at 0 until One UI has fully booted again.
+# Every zygote restart during the handover bumps sys.rescue_boot_count and
+# restarts bootchecker ("on property:init.svc.zygote=restarting"); at 5 it
+# reboots with "rescueparty_by_bootchecker R2", and higher levels prompt to
+# wipe app data. The switch's rescue_boot_suppress loop (stopped above) did
+# this during the session; this one ends once dev.bootcomplete has been 1
+# for a minute, or after 10 minutes.
+setprop sys.rescue_boot_count 0 2>/dev/null
+nohup sh -c ': rescue_boot_settle
+t=0; ok=0
+while [ $t -lt 600 ] && [ $ok -lt 60 ]; do
+    setprop sys.rescue_boot_count 0 2>/dev/null
+    [ "$(getprop dev.bootcomplete)" = 1 ] && ok=$((ok + 5))
+    sleep 5; t=$((t + 5))
+done' </dev/null >/dev/null 2>&1 &
 setprop ctl.start zygote
 setprop ctl.start zygote_next 2>/dev/null || true
 setprop ctl.start audioserver

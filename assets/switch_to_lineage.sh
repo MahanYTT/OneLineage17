@@ -118,6 +118,9 @@ guest_cgroups|0|guest cgroup v2 + bpf trees, app freezer (always on for Android 
 guest_aconfig|auto|private aconfig flag storage (on for Android 17 images)
 host_apex|tethering cellbroadcast|Android 17 images: APEXes taken from One UI, or none
 netd_restart|auto|Android 17 images: restart netd at switch and return
+services17_patch|on|Android 17 images: patched services.jar (no vold key changes, no Weaver)
+guest_fake_frp|on|private zeroed FRP partition for Lineage (protects One UI FRP)
+boot_watchdog|240|seconds until a stuck boot returns to One UI (0 = off)
 storage_sweep_full|30|full app-storage sweep every N x 10 s
 dns_heal|on|repair DNS for the current network when names fail
 dns_servers|(network)|force resolvers, comma separated
@@ -1147,6 +1150,42 @@ if [ "${START_CRASHLOOP_GUARD:-0}" = 1 ]; then
         nohup /system/bin/sh /data/local/tmp/crashloop_guard.sh </dev/null >/dev/null 2>&1 &
     fi
     echo "crash-loop guard started (log: /data/local/tmp/crashloop_guard.log)"
+fi
+
+# Boot watchdog. A boot that never gets to an unlocked user (stuck boot
+# animation, FallbackHome "Starting phone...") left the phone stranded: adb
+# over USB stalls once Lineage starts and Lineage has no Wi-Fi before unlock,
+# so the only way out was a hard reset (and a root re-grant). If user 0 is not
+# RUNNING_UNLOCKED within boot_watchdog seconds, save the logcat and go back to
+# One UI. Off: echo 0 > $STAGE/boot_watchdog
+BOOT_WD=$(flag boot_watchdog 240)
+case "$BOOT_WD" in ''|*[!0-9]*) BOOT_WD=240 ;; esac
+pkill -9 -f "boot_watchdog.sh" 2>/dev/null || true
+if [ "$BOOT_WD" -gt 0 ]; then
+    cat > /data/local/tmp/boot_watchdog.sh <<'BOOTWD_SH'
+#!/system/bin/sh
+LIMIT=$1
+STAGE=/data/local/tmp/lineage_stage
+LOG=/data/local/tmp/boot_watchdog.log
+echo "$(date) boot watchdog: waiting up to ${LIMIT}s for an unlocked user 0" > "$LOG"
+t=0
+while [ $t -lt "$LIMIT" ]; do
+    sleep 10; t=$((t + 10))
+    P=$(pidof system_server)
+    if [ -n "$P" ]; then
+        st=$(nsenter -t "$P" -m -- /system/bin/am get-started-user-state 0 2>/dev/null)
+        case "$st" in
+            *RUNNING_UNLOCKED*) echo "$(date) Lineage up: user 0 unlocked after ${t}s" >> "$LOG"; exit 0 ;;
+        esac
+    fi
+done
+echo "$(date) Lineage not unlocked after ${LIMIT}s (state: ${st:-no system_server}), returning to One UI" >> "$LOG"
+logcat -d -b main,system,crash -t 30000 > /data/local/tmp/boot_watchdog_logcat.txt 2>/dev/null
+sh "$STAGE/return_to_oneui.sh" > "$STAGE/boot_watchdog_return.log" 2>&1
+echo "$(date) return finished" >> "$LOG"
+BOOTWD_SH
+    nohup /system/bin/sh /data/local/tmp/boot_watchdog.sh "$BOOT_WD" </dev/null >/dev/null 2>&1 &
+    echo "boot watchdog started: back to One UI if Lineage is not unlocked in ${BOOT_WD}s"
 fi
 
 # Start UI Activator daemon

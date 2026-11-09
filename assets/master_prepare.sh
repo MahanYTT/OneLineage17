@@ -130,6 +130,47 @@ if ! mount | grep -q "$ROOTFS/dev "; then
     $BB mount --make-rprivate "$ROOTFS/dev"
 fi
 
+# Factory reset protection. Lineage's PersistentDataBlockService opens
+# ro.frp.pst, which is One UI's real FRP partition, and writes its own lock
+# credential handle there. On Android 17 it also aborts system_server
+# ("SecurityException: FRP is active ... setFrpCredentialHandle", verified on
+# an S26 Ultra). Give the guest a private, zeroed image of the same size on a
+# loop device, bound over the partition node in the guest's /dev only
+# ($ROOTFS/dev is private), so One UI's FRP data is never touched.
+# Off: echo 0 > $STAGE/guest_fake_frp
+case "$(cat "$STAGE/guest_fake_frp" 2>/dev/null | tr -d ' \t\r\n')" in
+    0|off|false|no) echo "Fake FRP partition disabled (flag): Lineage sees One UI's FRP" ;;
+    *)
+        FRP_NODE=$(readlink -f "$(getprop ro.frp.pst)" 2>/dev/null)
+        if [ -n "$FRP_NODE" ] && [ -b "$FRP_NODE" ]; then
+            FRP_SIZE=$(blockdev --getsize64 "$FRP_NODE" 2>/dev/null)
+            case "$FRP_SIZE" in ''|*[!0-9]*) FRP_SIZE=524288 ;; esac
+            if [ ! -f "$STAGE/fake_frp.img" ] || [ "$(stat -c %s "$STAGE/fake_frp.img")" != "$FRP_SIZE" ]; then
+                $BB dd if=/dev/zero of="$STAGE/fake_frp.img" bs="$FRP_SIZE" count=1 2>/dev/null
+            fi
+            FRP_LOOP=$($BB losetup -a | grep "$STAGE/fake_frp.img" | head -n 1 | cut -d: -f1)
+            if [ -z "$FRP_LOOP" ]; then
+                FRP_LOOP=$($BB losetup -f)
+                $BB losetup "$FRP_LOOP" "$STAGE/fake_frp.img"
+            fi
+            # Same owner, mode and label as the real node: Lineage's
+            # system_server (uid system) opens it ("EACCES" with root:root).
+            # ueventd resets a freshly attached loop node to root:root, so let
+            # it settle first (master_inner.sh sets the owner once more).
+            sleep 1
+            chown "$(stat -c %u:%g "$FRP_NODE")" "$FRP_LOOP" 2>/dev/null
+            chmod "$(stat -c %a "$FRP_NODE")" "$FRP_LOOP" 2>/dev/null
+            chcon "$(ls -Z "$FRP_NODE" | cut -d' ' -f1)" "$FRP_LOOP" 2>/dev/null
+            $BB umount -l "$ROOTFS$FRP_NODE" 2>/dev/null || true
+            if $BB mount --bind "$FRP_LOOP" "$ROOTFS$FRP_NODE"; then
+                echo "Fake FRP partition: $FRP_LOOP over $FRP_NODE ($FRP_SIZE bytes)"
+            else
+                echo "Fake FRP partition: bind failed"
+            fi
+        fi
+        ;;
+esac
+
 mount | grep -q "$ROOTFS/linkerconfig " || $BB mount --rbind /linkerconfig "$ROOTFS/linkerconfig"
 mount | grep -q "$ROOTFS/vendor " || $BB mount --bind /vendor "$ROOTFS/vendor"
 mount | grep -q "$ROOTFS/odm " || $BB mount --bind /odm "$ROOTFS/odm"
@@ -155,6 +196,26 @@ if [ "$LEGACY16" = 1 ] && [ -f "$STAGE/services_patched.jar" ]; then
     $BB umount -l "$ROOTFS/system/framework/services.jar" 2>/dev/null || true
     $BB mount --bind "$STAGE/services_patched.jar" "$ROOTFS/system/framework/services.jar"
     echo "Bound services_patched.jar -> $ROOTFS/system/framework/services.jar"
+fi
+# Android 17 (LineageOS 24) services.jar, patched in LockSettingsService and
+# SyntheticPasswordManager (see CHANGES_TO_TEST.md). Lineage's lock settings
+# talk to One UI's vold and the phone's Weaver hardware, both owned by One UI:
+#   - setCeStorageProtection is a no-op: it asked One UI's vold to re-protect
+#     user 0's CE key ("Generating storage key not allowed" -> system_server
+#     abort "Failed to protect CE key for user 0"); it must never succeed.
+#   - no Weaver (getWeaverService* = null, isWeaverDisabledOnUnsecuredUsers =
+#     true): Lineage enrolled its synthetic password into hardware Weaver
+#     slot 0, which belongs to One UI.
+# Off: echo 0 > $STAGE/services17_patch
+if [ "$LEGACY16" = 0 ] && [ -f "$STAGE/services17_patched.jar" ]; then
+    case "$(cat "$STAGE/services17_patch" 2>/dev/null | tr -d ' \t\r\n')" in
+        0|off|false|no) echo "services17_patched.jar disabled (flag)" ;;
+        *)
+            $BB umount -l "$ROOTFS/system/framework/services.jar" 2>/dev/null || true
+            $BB mount --bind "$STAGE/services17_patched.jar" "$ROOTFS/system/framework/services.jar"
+            echo "Bound services17_patched.jar -> $ROOTFS/system/framework/services.jar"
+            ;;
+    esac
 fi
 if [ "$LEGACY16" = 1 ] && [ -f "$STAGE/framework_patched.jar" ]; then
     $BB umount -l "$ROOTFS/system/framework/framework.jar" 2>/dev/null || true
