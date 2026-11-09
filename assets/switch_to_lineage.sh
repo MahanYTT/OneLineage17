@@ -116,7 +116,8 @@ min_refresh|60.0|minimum refresh rate (Hz)
 peak_refresh|120.0|peak refresh rate (Hz)
 guest_cgroups|0|guest cgroup v2 + bpf trees, app freezer (always on for Android 17 images)
 guest_aconfig|auto|private aconfig flag storage (on for Android 17 images)
-host_apex|tethering|Android 17 images: APEXes taken from One UI, or none
+host_apex|tethering cellbroadcast|Android 17 images: APEXes taken from One UI, or none
+netd_restart|auto|Android 17 images: restart netd at switch and return
 storage_sweep_full|30|full app-storage sweep every N x 10 s
 dns_heal|on|repair DNS for the current network when names fail
 dns_servers|(network)|force resolvers, comma separated
@@ -882,8 +883,8 @@ set_prop sys.rescue_boot_count 0
 # automatic reboot on some builds) once it reaches 5. The guest's system_server
 # may crash and recover several times during the session; without this loop the
 # counter accumulates and fires RescueParty mid-session.
-if ! ps -ef 2>/dev/null | grep -v grep | grep -q "rescue_boot_suppress"; then
-    nohup $BB sh -c "
+if ! ps -ef 2>/dev/null | grep -v grep | grep -q ": rescue_boot_suppress"; then
+    nohup $BB sh -c ": rescue_boot_suppress
 while true; do
     setprop sys.rescue_boot_count 0 2>/dev/null
     sleep 15
@@ -1037,10 +1038,16 @@ sleep 1
 # would die too. Keep only the codec processes down, which is what causes the
 # spin described above.
 setprop ctl.start media 2>/dev/null || true
-for svc in media.codec media.metrics; do
-    setprop ctl.stop $svc 2>/dev/null || true
-done
-kill -9 $(pidof media.codec) $(pidof media.metrics) 2>/dev/null || true
+# media.metrics: its init service is "mediametrics" (ctl.stop media.metrics
+# is "Could not find"), and it is marked "updatable". Killing the process
+# instead counted as crashes; after 4 init sets sys.init.updatable_crashing,
+# the next apexd start rolls back, fails, and apexd.rc's
+# "reboot_on_failure reboot,apexd-failed" reboots the phone (verified on an
+# S26 Ultra: "process with updatable components 'mediametrics' exited 4 times
+# before boot completed", then reboot,apexd-failed). Stop it through init only.
+setprop ctl.stop media.codec 2>/dev/null || true
+setprop ctl.stop mediametrics 2>/dev/null || true
+kill -9 $(pidof media.codec) 2>/dev/null || true
 
 # Samsung's init restarts media.codec on demand whenever any binder client
 # requests IMediaCodecList. The one-shot kill above is not enough: within
@@ -1050,8 +1057,11 @@ kill -9 $(pidof media.codec) $(pidof media.metrics) 2>/dev/null || true
 # binder thread pool, hits its 60-second watchdog, and kills system_server —
 # which is what "Lineage reboots / restarts after ~1 minute" looks like. Keep a
 # daemon that immediately kills any media.codec that init brings back.
-if ! ps -ef 2>/dev/null | grep -v grep | grep -q "media_codec_suppress"; then
-    nohup $BB sh -c "
+# The loop names itself (": media_codec_suppress") so this check and
+# return_to_oneui.sh's pkill -f can find it. Before, neither matched, the loop
+# survived every return and kept killing One UI's mediametrics too.
+if ! ps -ef 2>/dev/null | grep -v grep | grep -q ": media_codec_suppress"; then
+    nohup $BB sh -c ": media_codec_suppress
 while true; do
     sleep 3
     if pidof media.codec >/dev/null 2>&1; then
@@ -1059,8 +1069,7 @@ while true; do
         kill -9 \$(pidof media.codec) 2>/dev/null || true
     fi
     if pidof media.metrics >/dev/null 2>&1; then
-        setprop ctl.stop media.metrics 2>/dev/null || true
-        kill -9 \$(pidof media.metrics) 2>/dev/null || true
+        setprop ctl.stop mediametrics 2>/dev/null || true
     fi
 done
 " </dev/null >/dev/null 2>&1 &
@@ -1096,6 +1105,20 @@ else
     setprop ctl.stop media 2>/dev/null || true
     kill -9 $(pidof mediaserver) 2>/dev/null || true
     echo "One UI mediaserver stopped (Lineage starts its own)"
+fi
+
+# netd restart (Android 17+ images). The DNS resolver inside netd hands out
+# IDnsResolver.getUnstableInterface() once per caller uid; One UI's
+# system_server already took it at boot, so Lineage's ConnectivityService
+# (One UI's Tethering module, see host_apex) aborts system_server with
+# "UnsupportedOperationException: Already called by AID_SYSTEM" (verified on
+# an S26 Ultra with LineageOS 24). A fresh netd forgets the first caller.
+# return_to_oneui.sh restarts it again for One UI.
+# Off: echo 0 > $STAGE/netd_restart
+if [ "$(cat "$STAGE/guest_sdk" 2>/dev/null || echo 36)" -ge 37 ] 2>/dev/null && ! is_off "$(flag netd_restart auto)"; then
+    setprop ctl.restart netd 2>/dev/null
+    i=0; while [ $i -lt 20 ] && [ "$(getprop init.svc.netd)" != running ]; do sleep 0.5; i=$((i + 1)); done
+    echo "netd restarted for Lineage ($(getprop init.svc.netd))"
 fi
 
 # Suppress the host zygote only, so Samsung init does not resurrect it

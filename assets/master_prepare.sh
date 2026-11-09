@@ -771,12 +771,15 @@ echo "=== 8. Direct Mounting Extracted APEX Payloads ==="
 # bpfloader pinned in /sys/fs/bpf: on an S26 Ultra the Play-updated host module
 # pins map_netd_uid_permission_chunk_map, and LineageOS 24's own module aborts
 # system_server with "Cannot open uid permission map". Space-separated short
-# names; "none" uses the image's own for everything.
+# names; "none" uses the image own for everything. cellbroadcast: its
+# CellBroadcastService shares android.uid.networkstack with Tethering, so it
+# must be signed like it ("Signature mismatch on system package
+# com.android.cellbroadcastservice", verified on an S26 Ultra).
 # Change: echo "tethering wifi" > $STAGE/host_apex
 HOST_APEX=""
 if [ "$LEGACY16" = 0 ]; then
     HOST_APEX=$(cat "$STAGE/host_apex" 2>/dev/null | tr -d '\r')
-    [ -z "$HOST_APEX" ] && HOST_APEX="tethering"
+    [ -z "$HOST_APEX" ] && HOST_APEX="tethering cellbroadcast"
     [ "$HOST_APEX" = none ] && HOST_APEX=""
     echo "APEXes taken from One UI: ${HOST_APEX:-none}"
 fi
@@ -898,6 +901,20 @@ echo "=== 9. Bind-mounting Remaining Non-Payload APEXes ==="
 for a in /apex/*; do
     [ -d "$a" ] || continue
     base=$(basename "$a")
+    # Android 17 system_server starts LifeGuardManagerService from
+    # /apex/com.samsung.android.lifeguard/javalib/service-lifeguard.jar on
+    # this phone (verified on an S26 Ultra with LineageOS 24: "Creating a
+    # ClassLoader from .../service-lifeguard.jar is not allowed" when the APEX
+    # is missing). Bind it; derive_classpath then adds its jars.
+    case "$LEGACY16:$base" in
+        0:com.samsung.android.lifeguard|0:com.samsung.android.lifeguard@*)
+            if ! mount | grep -q "$ROOTFS/apex/$base "; then
+                mkdir -p "$ROOTFS/apex/$base"
+                $BB mount --bind "$a" "$ROOTFS/apex/$base" && echo "Bound $base (Android 17 LifeGuard)"
+            fi
+            continue
+            ;;
+    esac
     case "$base" in
         *samsung*)
             continue

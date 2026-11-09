@@ -111,6 +111,15 @@ setprop ctl.start vendor.fingerprint-default-1_0 2>/dev/null || true
 setprop ctl.start vendor.biometrics.fingerprint.inscreen 2>/dev/null || true
 
 setprop ctl.start surfaceflinger
+# Lineage 24 (Android 17) already took the DNS resolver's one-time
+# getUnstableInterface() call (see netd_restart in switch_to_lineage.sh);
+# One UI's system_server needs a fresh netd to get it again.
+if [ "$(cat /data/local/tmp/lineage_stage/guest_sdk 2>/dev/null || echo 36)" -ge 37 ] 2>/dev/null; then
+    case "$(cat /data/local/tmp/lineage_stage/netd_restart 2>/dev/null | tr -d ' \t\r\n')" in
+        0|off|false|no) ;;
+        *) setprop ctl.restart netd 2>/dev/null; sleep 1; echo "netd restarted for One UI" ;;
+    esac
+fi
 setprop ctl.start zygote
 setprop ctl.start zygote_next 2>/dev/null || true
 setprop ctl.start audioserver
@@ -121,7 +130,7 @@ setprop ctl.start cameraserver
 # Lineage's own mediaserver (started by master_inner.sh) must go before One
 # UI's "media" service can register media.player again.
 kill -9 $(pidof mediaserver) 2>/dev/null || true
-for svc in media media.extractor media.codec media.metrics wificond; do
+for svc in media media.extractor media.codec mediametrics wificond; do
     setprop ctl.start $svc 2>/dev/null || true
 done
 am force-stop com.sec.android.app.launcher 2>/dev/null || true
