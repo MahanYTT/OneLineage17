@@ -71,6 +71,18 @@ GUEST_FP=$(grep -m1 -E '^ro.(system.)?build.fingerprint=' "$ROOTFS/system/build.
 case "$GUEST_SDK" in ''|*[!0-9]*) GUEST_SDK=36 ;; esac
 LEGACY16=0; [ "$GUEST_SDK" -le 36 ] && LEGACY16=1
 echo "$GUEST_SDK" > "$STAGE/guest_sdk"
+# SAFETY STOP (2026-11-09). During a LineageOS 24 test session on an S26
+# Ultra ~186 GB were discarded on /data within minutes of Lineage's system
+# services starting, and Lineage requested a factory reset (RecoverySystem
+# "uncrypt setup bcb"). Lineage shares One UI's real /data/media and One
+# UI's installd/vold/keystore over binder, and its Android 17 framework runs
+# without the old Android 16 safety patches. Until the cause is found and
+# blocked, refuse to start an Android 17+ image.
+if [ "$LEGACY16" = 0 ] && [ ! -f "$STAGE/i_accept_data_loss_android17" ]; then
+    echo "REFUSING to start an Android $GUEST_SDK guest: it deleted user data on a test phone (see CHANGES_TO_TEST.md)."
+    $BB umount -l "$ROOTFS" 2>/dev/null
+    exit 1
+fi
 echo "Guest image: SDK $GUEST_SDK ($GUEST_FP), Android 16 patches: $([ $LEGACY16 = 1 ] && echo on || echo off)"
 # The extracted APEX payloads (*_payload.img) belong to one image: drop them
 # when the image changes so they are re-extracted from the new one.
@@ -210,6 +222,12 @@ fi
 #     are no-ops: they act on keystore2's user 0 super keys, which are One
 #     UI's ("Failed to initialize Keystore super keys for user 0"; resetting
 #     them would invalidate One UI's auth-bound keys).
+#   - CE storage: LockSettingsService.unlockCeStorage is a no-op and
+#     isCeStorageUnlocked (LockSettings + StorageManager) is true; One UI's
+#     vold refuses Lineage's secret for user 0 ("Failed to unlock CE storage
+#     for unsecured user 0"), and Lineage's /data is plain folders anyway.
+#     StorageManagerService.lockCeStorage is a no-op: it would lock One UI's
+#     user 0 storage.
 # Off: echo 0 > $STAGE/services17_patch
 if [ "$LEGACY16" = 0 ] && [ -f "$STAGE/services17_patched.jar" ]; then
     case "$(cat "$STAGE/services17_patch" 2>/dev/null | tr -d ' \t\r\n')" in

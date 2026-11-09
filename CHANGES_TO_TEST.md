@@ -3,6 +3,10 @@
 Written for the OneLineage17 fork running on a Galaxy S26 Ultra (One UI 9 /
 Android 17), but most of it applies to any device OneLineage supports.
 
+## WARNING: LineageOS 24 (Android 17) deleted user data
+
+On 2026-11-09, during a LineageOS 24 boot test, about 186 GB were discarded on the phone /data within minutes of Lineage system services starting, and Lineage requested a factory reset (RecoverySystem wrote the BCB; the phone rebooted into the recovery wipe prompt; "Try again" was chosen, so recovery did not wipe). Most user files were gone afterwards. Cause not proven yet. Candidates: Lineage shares One UI real /data/media, and its system_server uses One UI installd, vold and keystore over binder, so package-manager clean-up or the factory-reset flow acts on the real phone. master_prepare.sh now refuses Android 17+ images. **Do not run them.**
+
 ## Device results (2026-11-08, S26 Ultra, launched from adb as in 0.A)
 
 | Item | Result | Evidence |

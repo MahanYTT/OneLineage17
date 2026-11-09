@@ -1181,7 +1181,7 @@ while [ $t -lt "$LIMIT" ]; do
     fi
 done
 echo "$(date) Lineage not unlocked after ${LIMIT}s (state: ${st:-no system_server}), returning to One UI" >> "$LOG"
-logcat -d -b main,system,crash -t 30000 > /data/local/tmp/boot_watchdog_logcat.txt 2>/dev/null
+logcat -d -b main,system,crash > /data/local/tmp/boot_watchdog_logcat.txt 2>/dev/null
 sh "$STAGE/return_to_oneui.sh" > "$STAGE/boot_watchdog_return.log" 2>&1
 echo "$(date) return finished" >> "$LOG"
 BOOTWD_SH
