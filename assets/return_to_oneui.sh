@@ -66,6 +66,11 @@ if [ -d "$BACKUP_DIR" ] && [ -d "$LAUNCHER_DATA/databases" ]; then
 fi
 
 echo "=== [3/5] Unmounting Container Overlays ==="
+# Make the rootfs tree private before unmounting anything: its binds of One
+# UI's /apex/* may still be peers of the host mounts, and unmounting a peer
+# unmounts One UI's APEX too (apexd fails, init reboots the phone with
+# "reboot,apexd-failed").
+mount --make-rprivate /data/local/tmp/lineage_stage/rootfs 2>/dev/null || true
 umount -l /data/local/tmp/lineage_stage/rootfs/* 2>/dev/null || true
 umount -l /data/local/tmp/lineage_stage/rootfs/apex/* 2>/dev/null || true
 while mount | grep -q "/data/local/tmp/lineage_stage/rootfs"; do

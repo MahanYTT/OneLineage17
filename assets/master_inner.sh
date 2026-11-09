@@ -156,5 +156,29 @@ case "$(cat /data/local/tmp/lineage_flags/adb_framework_block 2>/dev/null | tr -
         fi ;;
 esac
 
+# Android 17+ images (e.g. LineageOS 24): zygote_exec has the Android 16
+# class paths compiled in, which do not match a newer image. Ask the image
+# itself (derive_classpath reads the classpath fragments of /system and every
+# mounted APEX) and start zygote through zygote_exec17, which takes them from
+# the environment. Android 16 images keep using zygote_exec unchanged.
+GUEST_SDK=$(grep -m1 '^ro.build.version.sdk=' /system/build.prop 2>/dev/null | cut -d= -f2)
+case "$GUEST_SDK" in ''|*[!0-9]*) GUEST_SDK=36 ;; esac
+if [ "$GUEST_SDK" -ge 37 ] && [ -x /data/zygote_exec17 ]; then
+    DCP=""
+    for b in /apex/com.android.sdkext/bin/derive_classpath /system/bin/derive_classpath; do
+        [ -x "$b" ] && { DCP=$b; break; }
+    done
+    mkdir -p /data/system/environ
+    rm -f /data/system/environ/classpath
+    if [ -n "$DCP" ] && $DCP /data/system/environ/classpath > /data/derive_classpath.log 2>&1             && [ -s /data/system/environ/classpath ]; then
+        while read -r kw name value; do
+            [ "$kw" = export ] && [ -n "$name" ] && export "$name=$value"
+        done < /data/system/environ/classpath
+        echo "[Pivoted Root] SDK $GUEST_SDK: class paths from $DCP, launching zygote_exec17..."
+        exec /data/zygote_exec17
+    fi
+    echo "[Pivoted Root] SDK $GUEST_SDK: derive_classpath failed (see /data/derive_classpath.log), falling back to zygote_exec"
+fi
+
 echo "[Pivoted Root] Launching LineageOS Zygote & SystemServer via zygote_exec..."
 exec /data/zygote_exec

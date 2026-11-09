@@ -114,7 +114,9 @@ gms_safety_fix|on|disable SafetyCenter API so host GMS stops crash-looping
 skip_setup|on|mark provisioned and disable setup wizards
 min_refresh|60.0|minimum refresh rate (Hz)
 peak_refresh|120.0|peak refresh rate (Hz)
-guest_cgroups|0|opt-in: give the guest cgroup v2 + app freezer (next boot)
+guest_cgroups|0|guest cgroup v2 + bpf trees, app freezer (always on for Android 17 images)
+guest_aconfig|auto|private aconfig flag storage (on for Android 17 images)
+host_apex|tethering|Android 17 images: APEXes taken from One UI, or none
 storage_sweep_full|30|full app-storage sweep every N x 10 s
 dns_heal|on|repair DNS for the current network when names fail
 dns_servers|(network)|force resolvers, comma separated
@@ -930,7 +932,7 @@ if [ -d "$APP_FILES" ]; then
         [ -f "$STAGE/$bf" ] || cp -f "$f" "$STAGE/$bf" 2>/dev/null || true
     done
 fi
-chmod 755 "$STAGE"/*.sh "$STAGE/zygote_exec" 2>/dev/null || true
+chmod 755 "$STAGE"/*.sh "$STAGE/zygote_exec" "$STAGE/zygote_exec17" 2>/dev/null || true
 
 # Toggle files for scripts that run INSIDE the guest (net_fix.sh,
 # app_storage_loop.sh) cannot be read from $STAGE after the pivot, so mirror the
@@ -1012,7 +1014,7 @@ setprop ctl.stop surfaceflinger
 kill -9 $(pidof surfaceflinger) 2>/dev/null || true
 kill -9 $(pidof bootanimation) 2>/dev/null || true
 kill -9 $(pidof app_process64) 2>/dev/null || true
-kill -9 $(pidof zygote_exec) 2>/dev/null || true
+kill -9 $(pidof zygote_exec) $(pidof zygote_exec17) 2>/dev/null || true
 kill -9 $(pidof zygote64) $(pidof zygote_next) 2>/dev/null || true
 kill -9 $(pidof system_server) 2>/dev/null || true
 sleep 1
@@ -1104,6 +1106,10 @@ cp -f "$STAGE/master_inner.sh" "$STAGE/data/master_inner.sh"
 chmod 755 "$STAGE/data/master_inner.sh"
 cp -f "$STAGE/zygote_exec" "$STAGE/data/zygote_exec"
 chmod 755 "$STAGE/data/zygote_exec"
+if [ -f "$STAGE/zygote_exec17" ]; then
+    cp -f "$STAGE/zygote_exec17" "$STAGE/data/zygote_exec17"
+    chmod 755 "$STAGE/data/zygote_exec17"
+fi
 
 # Launch takeover inside isolated mount namespace
 set_prop sys.boot_completed 0

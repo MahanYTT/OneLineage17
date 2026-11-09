@@ -2,6 +2,16 @@
 STAGE="/data/local/tmp/lineage_stage"
 ROOTFS="$STAGE/rootfs"
 BB=$(which busybox 2>/dev/null || echo "/data/adb/ksu/bin/busybox")
+
+# Filesystem of an image file, from its magic bytes: LineageOS 23.2 (Android
+# 16) images and APEX payloads are ext4, Android 17 builds may use erofs.
+img_fstype() {
+    if [ "$($BB dd if="$1" bs=1 skip=1024 count=4 2>/dev/null | $BB od -An -tx1 | tr -d ' \n')" = "e2e1f5e0" ]; then
+        echo erofs
+    else
+        echo ext4
+    fi
+}
 [ -x "$BB" ] || BB=$(find /data/adb /system /data -name busybox 2>/dev/null | head -n 1)
 
 # Disable kernel softlockup and hung-task panics for the duration of the
@@ -48,7 +58,26 @@ if ! mount | grep -q "$ROOTFS "; then
     LOOP=$($BB losetup -f)
     $BB losetup "$LOOP" "$STAGE/system.raw"
     echo "Using LOOP: $LOOP"
-    $BB mount -t ext4 -o ro "$LOOP" "$ROOTFS"
+    $BB mount -t "$(img_fstype "$STAGE/system.raw")" -o ro "$LOOP" "$ROOTFS"
+fi
+
+# Which Android the guest image is. OneLineage was built around LineageOS 23.2
+# (Android 16, SDK 36); its patched framework.jar/services.jar/preloaded-classes,
+# PermissionController and audio libraries are Android 16 builds and must not be
+# mounted over a newer image (e.g. LineageOS 24 / Android 17, SDK 37), whose
+# framework already matches One UI 9's Android 17 services.
+GUEST_SDK=$(grep -m1 '^ro.build.version.sdk=' "$ROOTFS/system/build.prop" 2>/dev/null | cut -d= -f2)
+GUEST_FP=$(grep -m1 -E '^ro.(system.)?build.fingerprint=' "$ROOTFS/system/build.prop" 2>/dev/null | cut -d= -f2)
+case "$GUEST_SDK" in ''|*[!0-9]*) GUEST_SDK=36 ;; esac
+LEGACY16=0; [ "$GUEST_SDK" -le 36 ] && LEGACY16=1
+echo "$GUEST_SDK" > "$STAGE/guest_sdk"
+echo "Guest image: SDK $GUEST_SDK ($GUEST_FP), Android 16 patches: $([ $LEGACY16 = 1 ] && echo on || echo off)"
+# The extracted APEX payloads (*_payload.img) belong to one image: drop them
+# when the image changes so they are re-extracted from the new one.
+if [ "$(cat "$STAGE/payload_fingerprint" 2>/dev/null)" != "$GUEST_FP" ]; then
+    rm -f "$STAGE"/*_payload.img 2>/dev/null
+    echo "$GUEST_FP" > "$STAGE/payload_fingerprint"
+    echo "Guest image changed: cleared cached APEX payloads"
 fi
 
 mkdir -p "$ROOTFS/postinstall" "$ROOTFS/dev" "$ROOTFS/proc" "$ROOTFS/sys" \
@@ -59,7 +88,10 @@ echo "=== 4. Setting up Core System Bind Mounts ==="
 mount | grep -q "$ROOTFS/proc " || $BB mount -t proc proc "$ROOTFS/proc"
 mount | grep -q "$ROOTFS/sys " || $BB mount -t sysfs sysfs "$ROOTFS/sys"
 
-# Opt-in, untested on device: give the guest the host's cgroup v2 tree.
+# Give the guest the host's cgroup v2 tree. Opt-in for Android 16 images,
+# ON by default for Android 17+ (LineageOS 24): there zygote aborts when it
+# forks system_server ("createProcessGroup(1000, 0) failed: No such file or
+# directory", verified on an S26 Ultra), so it cannot boot without it.
 # A fresh sysfs mount has an EMPTY /sys/fs/cgroup (submounts are not carried
 # over), while the guest's libprocessgroup reads the host init's
 # /dev/cgroup_info/cgroup.rc (via the /dev rbind) and expects the cgroup2
@@ -67,11 +99,21 @@ mount | grep -q "$ROOTFS/sys " || $BB mount -t sysfs sysfs "$ROOTFS/sys"
 # background task profiles probably fail, i.e. background apps are never
 # throttled. Default off because it changes how every guest process is
 # scheduled. Enable: echo 1 > $STAGE/guest_cgroups (ui_activator then also
-# turns on the cached-app freezer).
-case "$(cat "$STAGE/guest_cgroups" 2>/dev/null | tr -d ' \t\r\n')" in
+# turns on the cached-app freezer). Off on Android 17+: echo 0 > $STAGE/guest_cgroups
+GCG=$(cat "$STAGE/guest_cgroups" 2>/dev/null | tr -d ' \t\r\n')
+case "$GCG" in ""|auto) [ "$LEGACY16" = 0 ] && GCG=1 ;; esac
+case "$GCG" in
     1|on|true|yes)
         if mount | grep -q " /sys/fs/cgroup " && ! mount | grep -q "$ROOTFS/sys/fs/cgroup "; then
-            $BB mount --bind /sys/fs/cgroup "$ROOTFS/sys/fs/cgroup" && echo "Bound host /sys/fs/cgroup into the guest (guest_cgroups=1)"
+            $BB mount --bind /sys/fs/cgroup "$ROOTFS/sys/fs/cgroup" && echo "Bound host /sys/fs/cgroup into the guest (guest_cgroups=$GCG)"
+        fi
+        # Same story for the BPF filesystem on Android 17+: the Tethering
+        # module's service-connectivity aborts system_server when
+        # /sys/fs/bpf/net_shared (programs pinned by One UI's bpfloader) is
+        # missing ("jniClatCoordinator: lstat /sys/fs/bpf/net_shared errno=2",
+        # verified on an S26 Ultra with LineageOS 24).
+        if [ "$LEGACY16" = 0 ] && mount | grep -q " /sys/fs/bpf " && ! mount | grep -q "$ROOTFS/sys/fs/bpf "; then
+            $BB mount --bind /sys/fs/bpf "$ROOTFS/sys/fs/bpf" && echo "Bound host /sys/fs/bpf into the guest"
         fi
         ;;
 esac
@@ -109,38 +151,38 @@ if [ -d /product/apex ]; then
     mount | grep -q "$ROOTFS/system/product/apex " || $BB mount --bind /product/apex "$ROOTFS/system/product/apex"
 fi
 mount | grep -q "$ROOTFS/mnt " || $BB mount --rbind /mnt "$ROOTFS/mnt"
-if [ -f "$STAGE/services_patched.jar" ]; then
+if [ "$LEGACY16" = 1 ] && [ -f "$STAGE/services_patched.jar" ]; then
     $BB umount -l "$ROOTFS/system/framework/services.jar" 2>/dev/null || true
     $BB mount --bind "$STAGE/services_patched.jar" "$ROOTFS/system/framework/services.jar"
     echo "Bound services_patched.jar -> $ROOTFS/system/framework/services.jar"
 fi
-if [ -f "$STAGE/framework_patched.jar" ]; then
+if [ "$LEGACY16" = 1 ] && [ -f "$STAGE/framework_patched.jar" ]; then
     $BB umount -l "$ROOTFS/system/framework/framework.jar" 2>/dev/null || true
     $BB mount --bind "$STAGE/framework_patched.jar" "$ROOTFS/system/framework/framework.jar"
     echo "Bound framework_patched.jar -> $ROOTFS/system/framework/framework.jar"
 fi
-if [ -f "$STAGE/preloaded-classes" ]; then
+if [ "$LEGACY16" = 1 ] && [ -f "$STAGE/preloaded-classes" ]; then
     $BB umount -l "$ROOTFS/system/etc/preloaded-classes" 2>/dev/null || true
     $BB mount --bind "$STAGE/preloaded-classes" "$ROOTFS/system/etc/preloaded-classes"
     echo "Bound preloaded-classes -> $ROOTFS/system/etc/preloaded-classes"
 fi
-if [ -f "$STAGE/libaudio_aidl_conversion_common_cpp_patched.so" ]; then
+if [ "$LEGACY16" = 1 ] && [ -f "$STAGE/libaudio_aidl_conversion_common_cpp_patched.so" ]; then
     $BB umount -l "$ROOTFS/system/lib64/libaudio_aidl_conversion_common_cpp.so" 2>/dev/null || true
     $BB mount --bind "$STAGE/libaudio_aidl_conversion_common_cpp_patched.so" "$ROOTFS/system/lib64/libaudio_aidl_conversion_common_cpp.so"
     echo "Bound libaudio_aidl_conversion_common_cpp_patched.so"
 fi
-if [ -f "$STAGE/libaudioclient_aidl_conversion_patched.so" ]; then
+if [ "$LEGACY16" = 1 ] && [ -f "$STAGE/libaudioclient_aidl_conversion_patched.so" ]; then
     $BB umount -l "$ROOTFS/system/lib64/libaudioclient_aidl_conversion.so" 2>/dev/null || true
     $BB mount --bind "$STAGE/libaudioclient_aidl_conversion_patched.so" "$ROOTFS/system/lib64/libaudioclient_aidl_conversion.so"
     echo "Bound libaudioclient_aidl_conversion_patched.so"
 fi
-if [ -f "$STAGE/framework-res_patched.apk" ]; then
+if [ "$LEGACY16" = 1 ] && [ -f "$STAGE/framework-res_patched.apk" ]; then
     $BB umount -l "$ROOTFS/system/framework/framework-res.apk" 2>/dev/null || true
     $BB mount --bind "$STAGE/framework-res_patched.apk" "$ROOTFS/system/framework/framework-res.apk"
     echo "Bound framework-res_patched.apk -> $ROOTFS/system/framework/framework-res.apk"
 fi
 
-if [ -f "$STAGE/PermissionController_patched.apk" ]; then
+if [ "$LEGACY16" = 1 ] && [ -f "$STAGE/PermissionController_patched.apk" ]; then
     chmod 644 "$STAGE/PermissionController_patched.apk"
     PERM_APK=$(find "$ROOTFS/apex/com.android.permission" -name "PermissionController.apk" 2>/dev/null | head -n 1)
     if [ -n "$PERM_APK" ]; then
@@ -181,10 +223,12 @@ if [ -f /data/misc/adb/adb_keys ]; then
         chmod 640 "$STAGE/data/misc/adb/adb_keys" 2>/dev/null && \
         echo "Copied host adb_keys into the guest /data"
 fi
-if [ -f "$STAGE/zygote_exec" ]; then
-    cp -f "$STAGE/zygote_exec" "$STAGE/data/zygote_exec"
-    chmod 755 "$STAGE/data/zygote_exec"
-fi
+for z in zygote_exec zygote_exec17; do
+    if [ -f "$STAGE/$z" ]; then
+        cp -f "$STAGE/$z" "$STAGE/data/$z"
+        chmod 755 "$STAGE/data/$z"
+    fi
+done
 mkdir -p "$STAGE/data/user/0" "$STAGE/data/user_de/0"
 mkdir -p "$STAGE/data/system/users/0" "$STAGE/data/system_de/0/spblob" "$STAGE/data/system_ce/0"
 mkdir -p "$STAGE/data/misc/user/0" "$STAGE/data/misc_de/0" "$STAGE/data/misc_ce/0"
@@ -722,11 +766,29 @@ fi
 chmod 644 "$ROOTFS/apex/apex-info-list.xml" 2>/dev/null || true
 
 echo "=== 8. Direct Mounting Extracted APEX Payloads ==="
+# Android 17+ images: APEXes taken from One UI instead of the image (step 9
+# binds the host's copy). Tethering must match the BPF programs One UI's
+# bpfloader pinned in /sys/fs/bpf: on an S26 Ultra the Play-updated host module
+# pins map_netd_uid_permission_chunk_map, and LineageOS 24's own module aborts
+# system_server with "Cannot open uid permission map". Space-separated short
+# names; "none" uses the image's own for everything.
+# Change: echo "tethering wifi" > $STAGE/host_apex
+HOST_APEX=""
+if [ "$LEGACY16" = 0 ]; then
+    HOST_APEX=$(cat "$STAGE/host_apex" 2>/dev/null | tr -d '\r')
+    [ -z "$HOST_APEX" ] && HOST_APEX="tethering"
+    [ "$HOST_APEX" = none ] && HOST_APEX=""
+    echo "APEXes taken from One UI: ${HOST_APEX:-none}"
+fi
+
 mount_payload() {
     NAME="$1"
     TARGET="$2"
     IMG="$STAGE/${NAME}_payload.img"
     DEST="$ROOTFS/apex/$TARGET"
+    for h in $HOST_APEX; do
+        [ "$h" = "$NAME" ] && { echo "$NAME: using One UI's APEX"; return 0; }
+    done
     if [ ! -f "$IMG" ]; then
         CAPEX="$ROOTFS/system/apex/com.android.${NAME}.capex"
         [ -f "$CAPEX" ] || CAPEX="$ROOTFS/system/system_ext/apex/com.android.${NAME}.capex"
@@ -755,12 +817,13 @@ mount_payload() {
     $BB umount -l "$DEST" 2>/dev/null || true
     LOOP=$($BB losetup -f)
     $BB losetup "$LOOP" "$IMG"
-    $BB mount -t ext4 -o ro "$LOOP" "$DEST"
+    PFS=$(img_fstype "$IMG")
+    $BB mount -t "$PFS" -o ro "$LOOP" "$DEST"
     echo "Direct mounted $NAME on $LOOP -> $DEST"
     for vdir in "$ROOTFS/apex/${TARGET}"@*; do
         if [ -d "$vdir" ]; then
             $BB umount -l "$vdir" 2>/dev/null || true
-            $BB mount -t ext4 -o ro "$LOOP" "$vdir"
+            $BB mount -t "$PFS" -o ro "$LOOP" "$vdir"
             echo "Direct mounted $NAME on $LOOP -> $vdir"
         fi
     done
@@ -771,7 +834,7 @@ mount_payload() {
             vdest="$ROOTFS/apex/$vbase"
             mkdir -p "$vdest"
             $BB umount -l "$vdest" 2>/dev/null || true
-            $BB mount -t ext4 -o ro "$LOOP" "$vdest"
+            $BB mount -t "$PFS" -o ro "$LOOP" "$vdest"
             echo "Direct mounted $NAME on $LOOP -> $vdest (from host $vbase)"
         fi
     done
@@ -814,6 +877,9 @@ mount_payload "uprobestats" "com.android.uprobestats"
 mount_payload "adbd" "com.android.adbd"
 mount_payload "compos" "com.android.compos"
 mount_payload "apex.cts.shim" "com.android.apex.cts.shim"
+# Android 17 (LineageOS 24) only; skipped when the image has no such APEX.
+mount_payload "npumanager" "com.android.npumanager"
+mount_payload "webapp" "com.android.webapp"
 
 # Payload extractions above used the GSI's own /system/apex and /system/system_ext/apex
 # files. Now that the images are cached, present the HOST's /system/apex and
@@ -846,6 +912,56 @@ for a in /apex/*; do
     fi
 done
 
+# aconfig flag storage for Android 17+ images. Their framework reads feature
+# flags from /metadata/aconfig/{maps,boot}/<container>.*, but the image's own
+# /metadata is an empty directory. Verified on an S26 Ultra with LineageOS 24:
+# system_server dies at boot in AdvancedProtectionService with
+#   IllegalArgumentException: Invalid feature flag:
+#   android.security.aapm_feature_disable_insecure_wifi_autojoin
+# Build a private copy on a tmpfs: One UI's files for the containers the guest
+# shares with the host (vendor, odm), then the guest's own flag files for its
+# system, product, system_ext and every mounted APEX. Persistent flag overrides
+# (/metadata/aconfig/flags) start empty. One UI's /metadata is untouched.
+# Off: echo 0 > $STAGE/guest_aconfig
+GAC=$(cat "$STAGE/guest_aconfig" 2>/dev/null | tr -d ' \t\r\n')
+case "$GAC" in ""|auto) [ "$LEGACY16" = 0 ] && GAC=1 ;; esac
+case "$GAC" in
+    1|on|true|yes)
+        echo "=== 9b. Guest aconfig flag storage ==="
+        GM="$ROOTFS/metadata"
+        $BB umount -l "$GM" 2>/dev/null || true
+        if $BB mount -t tmpfs -o mode=0755 tmpfs "$GM"; then
+            mkdir -p "$GM/aconfig/maps" "$GM/aconfig/boot" "$GM/aconfig/flags"
+            cp -a /metadata/aconfig/maps/. "$GM/aconfig/maps/" 2>/dev/null
+            cp -a /metadata/aconfig/boot/. "$GM/aconfig/boot/" 2>/dev/null
+            add_container() {
+                [ -f "$2/package.map" ] && [ -f "$2/flag.map" ] && [ -f "$2/flag.val" ] || return 0
+                cp -f "$2/package.map" "$GM/aconfig/maps/$1.package.map"
+                cp -f "$2/flag.map" "$GM/aconfig/maps/$1.flag.map"
+                cp -f "$2/flag.val" "$GM/aconfig/boot/$1.val"
+                [ -f "$2/flag.info" ] && cp -f "$2/flag.info" "$GM/aconfig/boot/$1.info"
+                GAC_N=$((GAC_N + 1))
+            }
+            GAC_N=0
+            add_container system "$ROOTFS/system/etc/aconfig"
+            add_container product "$ROOTFS/system/product/etc/aconfig"
+            add_container system_ext "$ROOTFS/system/system_ext/etc/aconfig"
+            for a in "$ROOTFS"/apex/com.android.*; do
+                case "$a" in *@*) continue ;; esac
+                add_container "$(basename "$a")" "$a/etc"
+            done
+            chown -R 1000:1000 "$GM/aconfig" 2>/dev/null
+            chown 0:1000 "$GM/aconfig" "$GM/aconfig/maps" "$GM/aconfig/boot" "$GM/aconfig/flags" 2>/dev/null
+            chmod 775 "$GM/aconfig" "$GM/aconfig/maps" "$GM/aconfig/boot"
+            chmod 770 "$GM/aconfig/flags"
+            chmod 644 "$GM"/aconfig/maps/* "$GM"/aconfig/boot/* 2>/dev/null
+            echo "Guest aconfig storage: $GAC_N guest containers"
+        else
+            echo "Guest aconfig storage: tmpfs mount failed"
+        fi
+        ;;
+esac
+
 # PermissionController patch, second pass. The same block near step 4 runs
 # before the apex set is mounted, so find(1) finds nothing and Samsung's
 # PermissionController stays behind. Samsung's build requires
@@ -855,16 +971,42 @@ done
 #   -> "Permission controller keeps stopping"
 # and Gallery/Phone/Calendar can never be granted anything. Bind it now that
 # /apex/com.android.permission actually exists.
-if [ -f "$STAGE/PermissionController_patched.apk" ]; then
+if [ "$LEGACY16" = 1 ] && [ -f "$STAGE/PermissionController_patched.apk" ]; then
     chmod 644 "$STAGE/PermissionController_patched.apk" 2>/dev/null || true
     for PERM_APK in $(find "$ROOTFS/apex/com.android.permission" -name "PermissionController.apk" 2>/dev/null); do
         $BB umount -l "$PERM_APK" 2>/dev/null || true
         $BB mount --bind "$STAGE/PermissionController_patched.apk" "$PERM_APK" 2>/dev/null && echo "Bound PermissionController_patched.apk (late) -> $PERM_APK"
     done
 else
-    echo "!!! WARNING: PermissionController_patched.apk missing from $STAGE"
-    echo "!!! Samsung's PermissionController will crash every runtime-permission dialog"
-    echo "!!! (android.permission.RANGING not defined by platform)"
+    [ "$LEGACY16" = 1 ] && echo "!!! WARNING: PermissionController_patched.apk missing from $STAGE"
+    [ "$LEGACY16" = 1 ] && echo "!!! Samsung's PermissionController will crash every runtime-permission dialog"
+    [ "$LEGACY16" = 1 ] && echo "!!! (android.permission.RANGING not defined by platform)"
 fi
+
+# One UI's Tethering module (see HOST_APEX) is Google-signed and shares the
+# android.uid.networkstack user with the NetworkStack app, so the image's
+# test-key NetworkStack makes PackageManager abort system_server ("Signature
+# mismatch on system package com.google.android.networkstack.tethering for
+# shared user android.uid.networkstack", verified on an S26 Ultra). Use One
+# UI's Google-signed NetworkStack and its privapp allowlist with it.
+case " $HOST_APEX " in
+    *" tethering "*)
+        if [ -d /system/priv-app/NetworkStackGoogle ] && [ -d "$ROOTFS/system/priv-app/NetworkStack" ]; then
+            $BB mount --bind /system/priv-app/NetworkStackGoogle "$ROOTFS/system/priv-app/NetworkStack" && \
+                echo "NetworkStack: using One UI's NetworkStackGoogle"
+            if [ -f /system/etc/permissions/GoogleNetworkStack_permissions.xml ] && [ -f "$ROOTFS/system/etc/permissions/NetworkStack.xml" ]; then
+                $BB mount --bind /system/etc/permissions/GoogleNetworkStack_permissions.xml "$ROOTFS/system/etc/permissions/NetworkStack.xml"
+            fi
+        fi
+        ;;
+esac
+
+# Cut every mount under the rootfs off from its source. Binds of One UI's
+# /apex/* (and /dev, /mnt, ...) are created as peers of the host mounts, so
+# unmounting them later (return_to_oneui.sh) also unmounted One UI's own
+# APEXes: apexd then failed and init rebooted the phone
+# (ro.boot.bootreason "reboot,apexd-failed", seen on an S26 Ultra after
+# every return from Lineage).
+$BB mount --make-rprivate "$ROOTFS" 2>/dev/null && echo "Rootfs mounts made private"
 
 echo "=== ALL MOUNTS PREPARED SUCCESSFULLY ==="

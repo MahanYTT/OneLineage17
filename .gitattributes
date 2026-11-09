@@ -6,6 +6,7 @@ preloaded-classes text eol=lf
 # end-of-line conversion to it (a CRLF checkout on Windows, or a commit from
 # one, would rewrite 0x0d 0x0a byte pairs and corrupt the binary).
 zygote_exec binary
+zygote_exec17 binary
 *.jar binary
 *.apk binary
 *.img binary
