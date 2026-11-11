@@ -147,6 +147,8 @@ while [ $n -lt 20 ]; do
     for m in $MPS; do umount -l "$m" 2>/dev/null; done
     n=$((n + 1))
 done
+# Status bar overlays copied into One UI's resource cache for Lineage.
+rm -f /data/resource-cache/com.android.shell-ol_sb*-olsb.frro /data/resource-cache/*ol_sb*-olsb.frro@idmap 2>/dev/null
 BB=$(which busybox 2>/dev/null || echo /data/adb/ksu/bin/busybox)
 if [ -x "$BB" ]; then
     # Every loop device of the session (image, APEX payloads, fake FRP):

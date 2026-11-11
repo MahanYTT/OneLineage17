@@ -1197,6 +1197,21 @@ else
     echo "vold keeper off: One UI may reboot after the session (checkpoint_commit_failed)"
 fi
 
+# Status bar dimension overlays (see apply_statusbar_layout in the UI
+# activator): Lineage's overlay manager lists fabricated overlays through One
+# UI's idmap2d, i.e. from One UI's /data/resource-cache, so they go there
+# before Lineage boots. return_to_oneui.sh removes them again.
+rm -f /data/resource-cache/com.android.shell-ol_sb*-olsb.frro 2>/dev/null
+if ! is_off "$(flag statusbar_fix on)"; then
+    for a in sb_height_default sb_height_portrait sbui_pad_top sbui_pad_start sbui_pad_end; do
+        [ -f "$STAGE/$a.frro" ] || continue
+        dst="/data/resource-cache/com.android.shell-ol_$a-olsb.frro"
+        cp -f "$STAGE/$a.frro" "$dst" && chown system:system "$dst" && chmod 644 "$dst"
+        restorecon "$dst" 2>/dev/null
+    done
+    echo "status bar overlays installed: $(ls /data/resource-cache/com.android.shell-ol_sb*-olsb.frro 2>/dev/null | wc -l)"
+fi
+
 # Launch takeover inside isolated mount namespace
 set_prop sys.boot_completed 0
 $BB unshare -m $BB sh "$STAGE/data/master_inner.sh" </dev/null >"$STAGE/data/takeover.log" 2>&1 &
@@ -1305,7 +1320,7 @@ while true; do
                sleep 8
                g /system/bin/screencap -p > "$D/shot_camera.png" 2>/dev/null
                dumpsys media.camera 2>&1 | head -60 > "$D/camera_service.txt"
-               logcat -d -b main,system,crash -T "$T0" 2>/dev/null | grep -i -E "camera|aperture|AndroidRuntime|CameraX|CXCP|Unihal|Chi " | grep -v adsprpc | tail -300 > "$D/camera_log.txt"
+               logcat -d -b main,system,crash -T "$T0" 2>/dev/null | grep -i -E "camera|aperture|AndroidRuntime|CameraX|CXCP|Unihal|Chi |Parcel|^.{31}[A-Za-z]+ *: +at " | grep -v adsprpc | tail -400 > "$D/camera_log.txt"
                g /system/bin/input keyevent KEYCODE_HOME >/dev/null 2>&1 ;;
             4) T0=$(date '+%m-%d %H:%M:%S.000')
                g /system/bin/am start -W -a android.media.action.STILL_IMAGE_CAMERA --ei android.intent.extras.CAMERA_FACING 1 --ez android.intent.extra.USE_FRONT_CAMERA true > "$D/camera1_start.txt" 2>&1
@@ -1322,6 +1337,7 @@ while true; do
         echo "--- adbd/usb: usb.state=$(getprop sys.usb.state) config=$(getprop sys.usb.config) ffs.ready=$(getprop sys.usb.ffs.ready)"
         for u in /sys/class/udc/*; do echo "udc ${u##*/}: $(cat "$u/state" 2>/dev/null) speed=$(cat "$u/current_speed" 2>/dev/null)"; done
         echo "gadget UDC=$(cat /config/usb_gadget/g1/UDC 2>/dev/null)"
+        echo "kernel usb:"; dmesg 2>/dev/null | grep -i -E "dwc3|ffs|gadget|USB_STATE|usb_notify|android_work" | tail -12
         for a in $(pidof adbd); do
             echo "adbd $a: $(grep -E '^State' /proc/$a/status | tr -s '\t ' ' ') cgroup=$(tr '\n' ' ' < /proc/$a/cgroup)"
             for t in /proc/$a/task/*; do echo "  ${t##*/} $(cat $t/comm) $(grep -E '^State' $t/status | cut -f2) wchan=$(cat $t/wchan 2>/dev/null)"; done
@@ -1455,29 +1471,23 @@ skip_setup() {
 # Status bar layout like One UI's. One UI: status bar 149 px, icons centred
 # ~85 px down, ~45-50 px from both edges. Lineage (S26 Ultra, density 540):
 # 139 px (just the cutout), icons ~17 px higher, clock 30 px from the left
-# corner and a 95 px gap on the right. Fabricated dimension overlays, values in
-# px. "cmd overlay fabricate" refuses the raw type 0x05 ("dataType is out of
-# range of [16, 31]"), so the type name "dimen" with "149px" is tried first,
-# then the encoded TypedValue complex (integer mantissa << 8, unit px = 0).
-# Off: echo 0 > $STAGE/statusbar_fix. Values: $STAGE/statusbar_height (149),
-# statusbar_pad_top (20), statusbar_pad_start (48), statusbar_pad_end (0).
+# corner and a 95 px gap on the right. "cmd overlay fabricate" only takes
+# integer types ("dataType is out of range of [16, 31]" for dimensions, the
+# type name "dimen" is not accepted either), so the overlays are prebuilt .frro
+# files (tools/frro/make_frro.py: status bar height 149 px, SystemUI padding
+# top 20 / start 48 / end 0 px). The host part copies them into One UI's
+# /data/resource-cache before Lineage boots (Lineage's overlay manager lists
+# fabricated overlays through One UI's idmap2d); fix_frro_idmaps builds the
+# idmaps and enables them. Off: echo 0 > $STAGE/statusbar_fix
 apply_statusbar_layout() {
-    is_off "$(flag statusbar_fix on)" && { echo "[UI Activator] status bar layout fix off"; return 0; }
-    fab() {
-        o=$(gx /system/bin/cmd overlay fabricate --target "$1" --name "$2" "$3" dimen "${4}px" 2>&1)
-        [ -n "$o" ] && o="$o / $(gx /system/bin/cmd overlay fabricate --target "$1" --name "$2" "$3" 0x05 "$(( $4 << 8 ))" 2>&1)"
-        echo "[UI Activator] fabricate $3=$4px: ${o:-ok}"
-    }
-    H=$(flag statusbar_height 149)
-    fab android ol_sb_height_default android:dimen/status_bar_height_default "$H"
-    fab android ol_sb_height_portrait android:dimen/status_bar_height_portrait "$H"
-    fab com.android.systemui ol_sb_pad_top com.android.systemui:dimen/status_bar_padding_top "$(flag statusbar_pad_top 20)"
-    fab com.android.systemui ol_sb_pad_start com.android.systemui:dimen/status_bar_padding_start "$(flag statusbar_pad_start 48)"
-    fab com.android.systemui ol_sb_pad_end com.android.systemui:dimen/status_bar_padding_end "$(flag statusbar_pad_end 0)"
-    for ov in $(gx /system/bin/cmd overlay list 2>/dev/null | grep -o '[^ ]*:ol_sb_[a-z_]*'); do
-        o=$(gx /system/bin/cmd overlay enable "$ov" 2>&1)
-        echo "[UI Activator] enable $ov: ${o:-ok}"
-    done
+    if is_off "$(flag statusbar_fix on)"; then
+        for ov in $(gx /system/bin/cmd overlay list 2>/dev/null | grep -o '[^ ]*:ol_sb[a-z_]*'); do
+            gx /system/bin/cmd overlay disable "$ov" >/dev/null 2>&1
+        done
+        echo "[UI Activator] status bar layout fix off"
+        return 0
+    fi
+    echo "[UI Activator] status bar layout overlays registered: $(gx /system/bin/cmd overlay list 2>/dev/null | grep -c ':ol_sb')"
 }
 
 apply_cutout() {
@@ -1526,12 +1536,16 @@ fix_frro_idmaps() {
     chown system:system "$gcache"/*.frro 2>/dev/null
     chmod 644 "$gcache"/*.frro 2>/dev/null
     ok=0; bad=0
+    sysui=$(gx /system/bin/pm path com.android.systemui 2>/dev/null | head -n 1 | cut -d: -f2 | tr -d '\r')
+    [ -n "$sysui" ] || sysui=/system_ext/priv-app/SystemUI/SystemUI.apk
     for f in "$gcache"/*.frro; do
         [ -f "$f" ] || continue
         b=${f##*/}; gpath="/data/resource-cache/$b"
         name=${b%.frro}; name=${name#*-}; name=${name%-*}
         idm="/data/resource-cache/data@resource-cache@$b@idmap"
-        if gx /system/bin/idmap2 create --target-apk-path /system/framework/framework-res.apk \
+        tgt=/system/framework/framework-res.apk
+        case "$name" in ol_sbui_*) tgt=$sysui ;; esac
+        if gx /system/bin/idmap2 create --target-apk-path "$tgt" \
                 --overlay-apk-path "$gpath" --overlay-name "$name" --idmap-path "$idm" \
                 --ignore-overlayable >/dev/null 2>&1; then
             ok=$((ok + 1))
@@ -1545,6 +1559,13 @@ fix_frro_idmaps() {
         gx /system/bin/cmd overlay disable "$ov" >/dev/null 2>&1
         gx /system/bin/cmd overlay enable "$ov" >/dev/null 2>&1
     done
+    if ! is_off "$(flag statusbar_fix on)"; then
+        for ov in $(gx /system/bin/cmd overlay list 2>/dev/null | grep -o '[^ ]*:ol_sb[a-z_]*'); do
+            gx /system/bin/cmd overlay disable "$ov" >/dev/null 2>&1
+            o=$(gx /system/bin/cmd overlay enable "$ov" 2>&1)
+            echo "[UI Activator] enable $ov: ${o:-ok}"
+        done
+    fi
     echo "[UI Activator] frro: copied $n, idmaps ok=$ok failed=$bad"
     if [ "$1" = restart ]; then
         sp=$(gx /system/bin/pidof com.android.systemui 2>/dev/null)

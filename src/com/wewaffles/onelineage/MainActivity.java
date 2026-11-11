@@ -668,7 +668,9 @@ public class MainActivity extends Activity {
                 "zygote_exec", "zygote_exec17", "voldkeeper", "services17_patched.jar", "service-art17_patched.jar", "clean_apex_info_list.xml",
                 "services_patched.jar", "framework_patched.jar",
                 "7zz", "PermissionController_patched.apk",
-                "preloaded-classes"
+                "preloaded-classes",
+                "sb_height_default.frro", "sb_height_portrait.frro", "sbui_pad_top.frro",
+                "sbui_pad_start.frro", "sbui_pad_end.frro"
             };
             File filesDir = getFilesDir();
             for (String asset : assets) {

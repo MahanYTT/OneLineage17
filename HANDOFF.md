@@ -1,3 +1,102 @@
+# OneLineage17 hand-off (2026-11-11): LineageOS 24 on One UI 9
+
+**Read this section first; everything below it is older history.**
+Device: Galaxy S26 Ultra, One UI 9 / Android 17, KernelSU-Next temp root.
+Guest: LineageOS 24 (Android 17) GSI in `$STAGE/system.raw`
+(`$STAGE=/data/local/tmp/lineage_stage`; 23.2 kept in `$STAGE/backup_l23`).
+
+## Hard rules (the owner insists, and they are there for a reason)
+- **Never test destructively on this phone. It is the owner's daily phone.** On 2026-11-09 a
+  Lineage 24 boot wiped the real user data. Lineage's system_server shares One UI's
+  installd/vold/keystore over binder (see CHANGES_TO_TEST.md "WARNING"). Never weaken the
+  guards: services17_patched.jar, service-art17_patched.jar, private /data/media, data
+  tripwire, guard check in master_prepare.sh.
+- No private data in git: no serial, Wi-Fi name, IPs, MACs, carrier name, accounts,
+  screenshots or logs. The session diag files on the phone contain such data. Grep the
+  diff before every push.
+- Commit straight to `main`, LF line endings, and run `sh tests/run_all.sh` before every
+  push. New behaviour goes behind a `$STAGE/<flag>` file (FLAGS_TABLE in
+  switch_to_lineage.sh; tests/test_lineage_ctl.sh counts the rows, currently 43).
+- Shell root must be re-granted in KernelSU-Next after every reboot.
+
+## How to test safely (this is what worked)
+1. Push the changed `assets/*` to `$STAGE` (`adb push` to /data/local/tmp, then `su -c cp`).
+2. `echo 6 > $STAGE/session_minutes` gives a timed session. The boot watchdog returns to
+   One UI 6 min after unlock, or after 240 s if Lineage never unlocks, and saves logcat to
+   `/data/local/tmp/boot_watchdog_logcat.txt`.
+3. Launch: `su -c 'sh $STAGE/switch_to_lineage.sh > $STAGE/takeover_app.log 2>&1 &'`.
+4. USB adb dies about 1 min into the session (see below), so read the results after the
+   return:
+   - `/data/local/tmp/boot_watchdog.log`, `data_tripwire.log`, `ui_activator.log`;
+   - `$STAGE/boot_watchdog_return.log`;
+   - `/data/local/tmp/lineage_diag/`: snap_*.txt every 30 s, screenshots, camera test files.
+5. Check the data after every run: `/data/user/0` should still have 794 entries, the
+   `.onelineage_canary` files must exist in /data/user/0, /data/user_de/0 and
+   /data/media/0, and `$STAGE/tripwire_fired` must not exist.
+
+## Working now (verified on the phone)
+- Boot to unlocked user in about 20 s, and a clean return with no reboot. The vold keeper
+  (tools/voldkeeper) gives "vold" back to One UI. The return also kills every process left
+  in Lineage's mount namespace.
+- Wi-Fi and LTE are connected and validated (fix: drop the stale `package_cache`
+  NetworkStack entry).
+- 120 Hz (`min_refresh` auto = 120). Audio, browser and YouTube work (owner report).
+- APEX payload loop race fixed (attach_loop in master_prepare.sh).
+
+## Open problems, with what is known
+1. **Status bar misplaced.** One UI's bar is 149 px with icons ~85 px down and ~45-50 px
+   side padding. Lineage's is 139 px, with icons 17 px higher, the clock 30 px from the
+   left and a 95 px gap on the right.
+   - `cmd overlay fabricate` only accepts integer types, so dimension overlays are
+     prebuilt .frro files from `tools/frro/make_frro.py` (assets/sb_*.frro; validated
+     with idmap2 dump).
+   - switch_to_lineage.sh copies them into One UI's /data/resource-cache before boot,
+     because Lineage's OMS lists fabricated overlays through One UI's idmap2d.
+   - fix_frro_idmaps builds the idmaps (SystemUI target for `ol_sbui_*`) and enables them.
+   - return_to_oneui.sh removes them again.
+   - **Committed but not yet run on the phone.** Check `ui_activator.log` ("enable
+     ...ol_sb...") and `lineage_diag/shot_home.png`.
+2. **Camera.**
+   - With One UI's cameraserver, Aperture fails with `ParcelFormatException: Not enough
+     data` and then ERROR_CAMERA_OPEN_TIMEOUT.
+   - With `guest_cameraserver` (GSI cameraserver, the default on Android 17) the camera
+     opens, but Samsung's HAL fails configure_streams. The log shows
+     `m_isSetParamNull=1`: Samsung's HAL wants settings from Samsung's cameraserver SEH
+     extension, and the multicamera use case fails, on both front and rear.
+   - Likely path: keep One UI's cameraserver (`echo 0 > $STAGE/guest_cameraserver`) and
+     find which parcelable Lineage's framework cannot read. The diag camera_log.txt now
+     also captures stack traces. Then patch Lineage's framework.jar reader (dexpatch
+     style) to match.
+3. **USB adb stalls about 1 min after Lineage unlocks**, even with Lineage's
+   UsbDeviceManager no-op'd (services17: UsbHandlerLegacy.setEnabledFunctions and
+   setUsbConfig).
+   - At that point sys.usb.state stays `sec_charging,adb`, the UDC is configured
+     high-speed and adbd sleeps in its USB worker.
+   - The PC cannot even re-enumerate after `adb kill-server`, so it is a phone-side
+     data-path stall.
+   - The snapshots now include kernel USB lines; look for what Lineage does at ~60-90 s
+     after unlock (the UI activator's fix_app_dirs touches adb_enabled; AdbService /
+     AdbDebuggingManager; the USB HAL calls from UsbPortManager).
+   - adb over Wi-Fi survived this on 23.2 (`echo 5555 > $STAGE/adb_tcp`).
+4. **Volume-key escape:** pressing Vol Up and Vol Down together now returns at once
+   (unit-tested, not yet pressed on the phone with this build).
+5. Smaller items:
+   - Loop devices of a session stay attached after the return (harmless now).
+   - Duplicate cutout .frro files pile up in Lineage's resource-cache.
+   - Biometrics: the owner deferred it.
+
+## Where things are
+- assets/switch_to_lineage.sh: host side, FLAGS_TABLE, UI activator, diag, watchdogs.
+- assets/master_prepare.sh: rootfs, APEX payloads, data guards.
+- assets/master_inner.sh: inside the guest namespace (vold, mediaserver, cameraserver,
+  zygote).
+- assets/return_to_oneui.sh: the return.
+- tools/dexpatch (services17.txt patch list), tools/voldkeeper (Rust, static musl),
+  tools/zygote_exec17, tools/frro.
+- CHANGES_TO_TEST.md: per-item device results.
+
+---
+
 # OneLineage17 hand-off: overheating, setup wizard hang, status bar size
 
 > **Update 2026-11-08 (cloud session, nothing tested on the device):** the patches for
