@@ -112,7 +112,7 @@ crashloop_window_s|180|... within this many seconds
 dexopt_throttle|on|no background dexopt, fewer dex2oat threads
 gms_safety_fix|on|disable SafetyCenter API so host GMS stops crash-looping
 skip_setup|on|mark provisioned and disable setup wizards
-min_refresh|60.0|minimum refresh rate (Hz)
+min_refresh|auto|minimum refresh rate (Hz); auto = 120 on Android 17, else 60
 peak_refresh|120.0|peak refresh rate (Hz)
 guest_cgroups|0|guest cgroup v2 + bpf trees, app freezer (always on for Android 17 images)
 guest_aconfig|auto|private aconfig flag storage (on for Android 17 images)
@@ -1263,6 +1263,7 @@ while true; do
             echo "--- package $pk"; nsenter -t "$P" -m -- /system/bin/dumpsys package "$pk" 2>&1 | grep -E "Package \[|codePath|versionName|flags=|MAINLINE_NETWORK_STACK|INetworkStackConnector|enabled=" | head -20
         done
         echo "--- display"; nsenter -t "$P" -m -- /system/bin/dumpsys display 2>&1 | grep -i -E "supportedModes|mActiveModeId|mDefaultModeId|mUserPreferredMode|renderFrameRate|refreshRate=" | head -12
+        echo "--- mode votes"; nsenter -t "$P" -m -- /system/bin/dumpsys display 2>&1 | grep -A40 "DisplayModeDirector" | grep -i -E "Vote|priority|mAppRequest|BaseMode|renderRange|physical" | head -30
         echo "--- refresh settings"; for k in peak_refresh_rate min_refresh_rate user_refresh_rate; do echo "$k=$(nsenter -t "$P" -m -- /system/bin/settings get system $k 2>&1)"; done
         echo "--- sf"; nsenter -t "$P" -m -- /system/bin/dumpsys SurfaceFlinger 2>&1 | grep -i -E "activeMode|refresh rate|vsync period|RefreshRateSelector|Display modes|desiredMode" | head -12
     } > "$f" 2>&1
@@ -1303,6 +1304,7 @@ while [ $t -lt "$LIMIT" ]; do
                 echo "$(date) timed session: returning to One UI in ${M} min" >> "$LOG"
                 sleep $((M * 60))
                 echo "$(date) timed session over, returning to One UI" >> "$LOG"
+                logcat -d -b main,system,crash > /data/local/tmp/boot_watchdog_logcat.txt 2>/dev/null
                 sh "$STAGE/return_to_oneui.sh" > "$STAGE/boot_watchdog_return.log" 2>&1
                 exit 0 ;;
         esac
@@ -1559,10 +1561,21 @@ while true; do
             # the panel, SurfaceFlinger and the GPU at 120 Hz even on a static
             # screen that never turns off (stayon above): steady heat for no
             # benefit. Let it idle down to 60 Hz; scrolling still runs at the peak.
-            # Toggle: echo 120 > $STAGE/min_refresh (old behaviour), and
+            # Android 17 images are the exception: their DisplayModeDirector
+            # picks the render rate by frame-rate category on this adaptive
+            # panel (normal 60, high 90), so with a 60 Hz floor LineageOS 24
+            # never rendered above 60 Hz on a static screen and at most 90 Hz
+            # while scrolling (S26 Ultra: 120 Hz panel mode, renderFrameRate 60).
+            # auto = 120 there; the thermal guard still applies.
+            # Toggle: echo 60 (or 120) > $STAGE/min_refresh, and
             #         $STAGE/peak_refresh for the upper bound (default 120).
+            MINR=$(flag min_refresh auto)
+            if [ "$MINR" = auto ]; then
+                if [ "$(cat "$STAGE/guest_sdk" 2>/dev/null || echo 36)" -ge 37 ] 2>/dev/null; then MINR=120.0; else MINR=60.0; fi
+            fi
             $BB nsenter -t $PID -m /system/bin/settings put system peak_refresh_rate "$(flag peak_refresh 120.0)"
-            $BB nsenter -t $PID -m /system/bin/settings put system min_refresh_rate "$(flag min_refresh 60.0)"
+            $BB nsenter -t $PID -m /system/bin/settings put system min_refresh_rate "$MINR"
+            echo "[UI Activator] refresh rate: min $MINR, peak $(flag peak_refresh 120.0)"
             # Cached-app freezer. Only meaningful when the guest can see the
             # cgroup v2 tree (opt-in guest_cgroups, see master_prepare.sh).
             case "$(flag guest_cgroups 0)" in

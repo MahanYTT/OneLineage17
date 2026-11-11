@@ -27,6 +27,9 @@ pkill -9 -f "crashloop_guard.sh" 2>/dev/null || true
 pkill -9 -f "boot_watchdog.sh" 2>/dev/null || true
 pkill -9 -f "data_tripwire.sh" 2>/dev/null || true
 pkill -9 -f "lineage_diag.sh" 2>/dev/null || true
+# The session logcat writer (switch_to_lineage.sh): stop it so One UI's logs
+# do not rotate Lineage's out of /data/local/tmp/takeover_logcat.log*.
+pkill -f "takeover_logcat.log" 2>/dev/null || true
 # The data tripwire freezes and stops One UI's installd when it fires.
 kill -CONT $(pidof installd) 2>/dev/null
 setprop ctl.start installd 2>/dev/null

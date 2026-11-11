@@ -1123,6 +1123,14 @@ fi
 # mismatch on system package com.google.android.networkstack.tethering for
 # shared user android.uid.networkstack", verified on an S26 Ultra). Use One
 # UI's Google-signed NetworkStack and its privapp allowlist with it.
+# PackageManager caches parsed packages by folder name and trusts the cache
+# while it is newer than the folder. One UI's files are dated 2022, so the
+# cached entry for the image's own NetworkStack.apk was kept, the scan failed
+# ("Failed to collect certificates from .../NetworkStack/NetworkStack.apk")
+# and Lineage had no network stack: no Wi-Fi ("IpClient is not ready") and no
+# mobile IP (seen on an S26 Ultra with LineageOS 24). Drop that one entry so
+# whichever NetworkStack is bound gets scanned.
+rm -f "$STAGE"/data/system/package_cache/*/NetworkStack-* 2>/dev/null
 case " $HOST_APEX " in
     *" tethering "*)
         if [ -d /system/priv-app/NetworkStackGoogle ] && [ -d "$ROOTFS/system/priv-app/NetworkStack" ]; then
