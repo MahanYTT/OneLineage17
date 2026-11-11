@@ -122,6 +122,7 @@ services17_patch|on|Android 17 images: patched services.jar (no vold key changes
 guest_fake_frp|on|private zeroed FRP partition for Lineage (protects One UI FRP)
 boot_watchdog|240|seconds until a stuck boot returns to One UI (0 = off)
 data_tripwire|on|kill Lineage if One UI user data starts disappearing
+session_diag|on|save Lineage Wi-Fi/telephony state every 30 s
 storage_sweep_full|30|full app-storage sweep every N x 10 s
 dns_heal|on|repair DNS for the current network when names fail
 dns_servers|(network)|force resolvers, comma separated
@@ -386,6 +387,7 @@ log "key escape armed (hold ${HOLD}s)"
 $GETEVENT 2>/dev/null | while read -r dev typ key val rest; do
     [ "$typ" = EV_KEY ] || continue
     case "$val" in DOWN) v=1 ;; UP) v=0 ;; *) continue ;; esac
+    case "$key" in KEY_VOLUME*) log "seen $key $val" ;; esac
     case "$key" in
         KEY_VOLUMEUP) up=$v ;;
         KEY_VOLUMEDOWN) down=$v ;;
@@ -845,7 +847,9 @@ rm -f /data/local/tmp/takeover_logcat.log 2>/dev/null || true
 # Rotating, capped capture (4 MB x 3 files, crash+system buffers only). The old
 # unbounded `logcat -f` grew past 14 GB and kept flash/CPU busy for no reason.
 rm -f /data/local/tmp/takeover_logcat.log.* 2>/dev/null || true
-nohup logcat -b crash,system -r 4096 -n 3 -f /data/local/tmp/takeover_logcat.log </dev/null >/dev/null 2>&1 &
+# main buffer too (Wi-Fi, telephony, apps), with the audio HAL conversion
+# spam silenced: it was ~90 % of all lines and pushed everything else out.
+nohup logcat -b main,crash,system -r 8192 -n 4 -f /data/local/tmp/takeover_logcat.log     AidlConversionCppNdk:S AidlConversion:S AudioSystem:S AudioManager:S </dev/null >/dev/null 2>&1 &
 sleep 0.2
 chmod 666 /data/local/tmp/takeover_logcat.log 2>/dev/null || true
 
@@ -1205,6 +1209,41 @@ TRIPWIRE_SH
     echo "data tripwire armed (log: /data/local/tmp/data_tripwire.log)"
 fi
 
+# Session diagnostics. adb over USB stalls once Lineage runs and Lineage may
+# have no network, so collect what is needed to debug it from One UI later:
+# every 30 s, Lineage's Wi-Fi, connectivity and telephony state plus whether
+# the key escape is alive, into /data/local/tmp/lineage_diag (last 4 kept).
+# Off: echo 0 > $STAGE/session_diag
+pkill -9 -f "lineage_diag.sh" 2>/dev/null || true
+if ! is_off "$(flag session_diag on)"; then
+    cat > /data/local/tmp/lineage_diag.sh <<'DIAG_SH'
+#!/system/bin/sh
+D=/data/local/tmp/lineage_diag
+rm -rf "$D"; mkdir -p "$D"
+i=0
+while true; do
+    sleep 30; i=$((i + 1))
+    P=$(pidof system_server)
+    [ -n "$P" ] || continue
+    f="$D/snap_$((i % 4)).txt"
+    {
+        echo "=== $(date) system_server=$P"
+        echo "--- key escape: $(pidof getevent) $(ps -A -o PID,ARGS 2>/dev/null | grep -c '[k]ey_escape.sh')"
+        echo "--- user 0: $(nsenter -t "$P" -m -- /system/bin/am get-started-user-state 0 2>&1)"
+        echo "--- wifi"; nsenter -t "$P" -m -- /system/bin/dumpsys wifi 2>&1 | head -150
+        echo "--- connectivity"; nsenter -t "$P" -m -- /system/bin/dumpsys connectivity 2>&1 | head -80
+        echo "--- telephony"; nsenter -t "$P" -m -- /system/bin/dumpsys telephony.registry 2>&1 | grep -E "mServiceState|mDataConnectionState|mSignalStrength|mCallState|SIM" | head -20
+        echo "--- isub/sim"; nsenter -t "$P" -m -- /system/bin/dumpsys isub 2>&1 | head -40
+        echo "--- ip"; ip addr 2>&1 | grep -E "wlan|rmnet|inet " | head -20
+        echo "--- networkstack query"; nsenter -t "$P" -m -- /system/bin/cmd package query-services -a android.net.INetworkStackConnector 2>&1 | head -20
+        echo "--- networkstack package"; nsenter -t "$P" -m -- /system/bin/dumpsys package com.google.android.networkstack 2>&1 | grep -E "versionName|codePath|flags=|privateFlags|signatures|MAINLINE_NETWORK_STACK|Service|android.net.INetworkStackConnector|enabled|granted=false" | head -40
+    } > "$f" 2>&1
+done
+DIAG_SH
+    nohup /system/bin/sh /data/local/tmp/lineage_diag.sh </dev/null >/dev/null 2>&1 &
+    echo "session diagnostics: /data/local/tmp/lineage_diag"
+fi
+
 # Boot watchdog. A boot that never gets to an unlocked user (stuck boot
 # animation, FallbackHome "Starting phone...") left the phone stranded: adb
 # over USB stalls once Lineage starts and Lineage has no Wi-Fi before unlock,
@@ -1228,7 +1267,16 @@ while [ $t -lt "$LIMIT" ]; do
     if [ -n "$P" ]; then
         st=$(nsenter -t "$P" -m -- /system/bin/am get-started-user-state 0 2>/dev/null)
         case "$st" in
-            *RUNNING_UNLOCKED*) echo "$(date) Lineage up: user 0 unlocked after ${t}s" >> "$LOG"; exit 0 ;;
+            *RUNNING_UNLOCKED*)
+                echo "$(date) Lineage up: user 0 unlocked after ${t}s" >> "$LOG"
+                # Optional timed session (testing): $STAGE/session_minutes
+                M=$(cat "$STAGE/session_minutes" 2>/dev/null | tr -dc '0-9')
+                [ -n "$M" ] && [ "$M" -gt 0 ] || exit 0
+                echo "$(date) timed session: returning to One UI in ${M} min" >> "$LOG"
+                sleep $((M * 60))
+                echo "$(date) timed session over, returning to One UI" >> "$LOG"
+                sh "$STAGE/return_to_oneui.sh" > "$STAGE/boot_watchdog_return.log" 2>&1
+                exit 0 ;;
         esac
     fi
 done
