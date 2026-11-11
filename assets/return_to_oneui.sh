@@ -54,25 +54,32 @@ pkill -9 -x zygote_next 2>/dev/null || true
 kill -9 $(pidof surfaceflinger) 2>/dev/null || true
 
 # Everything still running in Lineage's mount namespace (recorded by
-# switch_to_lineage.sh at launch) goes before One UI starts. Lineage's
-# NetworkStack process outlived the return once and One UI's system_server
-# died on its stale Tethering connector ("TetheringManager ...
-# DeadObjectException", S26 Ultra). Never our own or init's namespace.
+# switch_to_lineage.sh at launch) or any child namespace unshared by Lineage's
+# zygote (which have /postinstall in their mounts from pivot_root) goes before
+# One UI starts. Without this, orphaned zygote children (webview_zygote,
+# com.android.nfc, apps...) survive the return, keep running in One UI, and
+# hold the session loop devices open. Never our own or init's namespace.
 STAGE_DIR=/data/local/tmp/lineage_stage
 GUEST_NS=$(cat "$STAGE_DIR/guest_mnt_ns" 2>/dev/null)
 # Only trust it when it was written since this boot (namespace ids are
 # reused after a reboot).
 BOOT_T=$(( $(date +%s) - $(cut -d. -f1 /proc/uptime) ))
 [ "$(stat -c %Y "$STAGE_DIR/guest_mnt_ns" 2>/dev/null || echo 0)" -gt "$BOOT_T" ] 2>/dev/null || GUEST_NS=""
-if [ -n "$GUEST_NS" ] && [ "$GUEST_NS" != "$(readlink /proc/self/ns/mnt)" ] &&    [ "$GUEST_NS" != "$(readlink /proc/1/ns/mnt)" ]; then
-    n=0
-    for d in /proc/[0-9]*; do
-        p=${d#/proc/}
-        [ "$p" = "$$" ] && continue
-        [ "$(readlink "$d/ns/mnt" 2>/dev/null)" = "$GUEST_NS" ] && kill -9 "$p" 2>/dev/null && n=$((n + 1))
-    done
-    echo "Stopped $n processes left in Lineage's namespace"
-fi
+n=0
+HOST_NS=$(readlink /proc/1/ns/mnt 2>/dev/null)
+SELF_NS=$(readlink /proc/self/ns/mnt 2>/dev/null)
+for d in /proc/[0-9]*; do
+    p=${d#/proc/}
+    [ "$p" = "$$" ] && continue
+    pns=$(readlink "$d/ns/mnt" 2>/dev/null)
+    [ "$pns" = "$HOST_NS" ] || [ "$pns" = "$SELF_NS" ] && continue
+    if [ -n "$GUEST_NS" ] && [ "$pns" = "$GUEST_NS" ]; then
+        kill -9 "$p" 2>/dev/null && n=$((n + 1))
+    elif grep -q " /postinstall" "$d/mounts" 2>/dev/null; then
+        kill -9 "$p" 2>/dev/null && n=$((n + 1))
+    fi
+done
+echo "Stopped $n processes left in Lineage's namespaces"
 rm -f "$STAGE_DIR/guest_mnt_ns"
 
 # Lineage's vold took over the binder name "vold" from One UI's vold (which

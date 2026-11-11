@@ -24,7 +24,12 @@ assert_no_file "$T/setprop_calls" "healthy config: nothing rewritten"
 setup
 setp sys.usb.config adb
 run 1
-assert_eq "$(cat "$T/props/sys.usb.config")" "sec_charging,adb" "bare adb -> sec_charging,adb"
+assert_no_file "$T/setprop_calls" "bare adb is kept (no unnecessary rewrite)"
+
+setup
+setp sys.usb.config none
+run 1
+assert_eq "$(cat "$T/props/sys.usb.config")" "adb" "restored adb when lost"
 
 setup
 setp sys.usb.config mtp

@@ -16,7 +16,7 @@ Guest: LineageOS 24 (Android 17) GSI in `$STAGE/system.raw`
   diff before every push.
 - Commit straight to `main`, LF line endings, and run `sh tests/run_all.sh` before every
   push. New behaviour goes behind a `$STAGE/<flag>` file (FLAGS_TABLE in
-  switch_to_lineage.sh; tests/test_lineage_ctl.sh counts the rows, currently 43).
+  switch_to_lineage.sh; tests/test_lineage_ctl.sh counts the rows, currently 44).
 - Shell root must be re-granted in KernelSU-Next after every reboot.
 
 ## How to test safely (this is what worked)
@@ -25,8 +25,7 @@ Guest: LineageOS 24 (Android 17) GSI in `$STAGE/system.raw`
    One UI 6 min after unlock, or after 240 s if Lineage never unlocks, and saves logcat to
    `/data/local/tmp/boot_watchdog_logcat.txt`.
 3. Launch: `su -c 'sh $STAGE/switch_to_lineage.sh > $STAGE/takeover_app.log 2>&1 &'`.
-4. USB adb dies about 1 min into the session (see below), so read the results after the
-   return:
+4. Read the results after the return (or live via adb over USB / Wi-Fi):
    - `/data/local/tmp/boot_watchdog.log`, `data_tripwire.log`, `ui_activator.log`;
    - `$STAGE/boot_watchdog_return.log`;
    - `/data/local/tmp/lineage_diag/`: snap_*.txt every 30 s, screenshots, camera test files.
@@ -36,12 +35,17 @@ Guest: LineageOS 24 (Android 17) GSI in `$STAGE/system.raw`
 
 ## Working now (verified on the phone)
 - Boot to unlocked user in about 20 s, and a clean return with no reboot. The vold keeper
-  (tools/voldkeeper) gives "vold" back to One UI. The return also kills every process left
-  in Lineage's mount namespace.
+  (tools/voldkeeper) gives "vold" back to One UI.
+- All leftover Lineage processes killed on return: processes in child mount namespaces
+  unshared by zygote (webview_zygote, com.android.nfc, com.android.se, apps) are detected
+  via ` /postinstall` in `/proc/$p/mounts` and killed.
+- All session loop devices detach cleanly on return (no more loop device accumulation).
 - Wi-Fi and LTE are connected and validated (fix: drop the stale `package_cache`
   NetworkStack entry).
 - 120 Hz (`min_refresh` auto = 120). Audio, browser and YouTube work (owner report).
 - APEX payload loop race fixed (attach_loop in master_prepare.sh).
+- Status bar .frro dimension overlays verified with Lineage's idmap2 on device and
+  staged in `$STAGE`.
 
 ## Open problems, with what is known
 1. **Status bar misplaced.** One UI's bar is 149 px with icons ~85 px down and ~45-50 px
@@ -49,49 +53,54 @@ Guest: LineageOS 24 (Android 17) GSI in `$STAGE/system.raw`
    left and a 95 px gap on the right.
    - `cmd overlay fabricate` only accepts integer types, so dimension overlays are
      prebuilt .frro files from `tools/frro/make_frro.py` (assets/sb_*.frro; validated
-     with idmap2 dump).
+     with idmap2 on device).
    - switch_to_lineage.sh copies them into One UI's /data/resource-cache before boot,
      because Lineage's OMS lists fabricated overlays through One UI's idmap2d.
    - fix_frro_idmaps builds the idmaps (SystemUI target for `ol_sbui_*`) and enables them.
    - return_to_oneui.sh removes them again.
-   - **Committed but not yet run on the phone.** Check `ui_activator.log` ("enable
-     ...ol_sb...") and `lineage_diag/shot_home.png`.
+   - **Now pushed to $STAGE and ready to test on device.** Check `ui_activator.log`
+     ("enable ...ol_sb...") and `lineage_diag/shot_home.png`.
 2. **Camera.**
-   - With One UI's cameraserver, Aperture fails with `ParcelFormatException: Not enough
-     data` and then ERROR_CAMERA_OPEN_TIMEOUT.
-   - With `guest_cameraserver` (GSI cameraserver, the default on Android 17) the camera
-     opens, but Samsung's HAL fails configure_streams. The log shows
-     `m_isSetParamNull=1`: Samsung's HAL wants settings from Samsung's cameraserver SEH
-     extension, and the multicamera use case fails, on both front and rear.
-   - Likely path: keep One UI's cameraserver (`echo 0 > $STAGE/guest_cameraserver`) and
-     find which parcelable Lineage's framework cannot read. The diag camera_log.txt now
-     also captures stack traces. Then patch Lineage's framework.jar reader (dexpatch
-     style) to match.
-3. **USB adb stalls about 1 min after Lineage unlocks**, even with Lineage's
-   UsbDeviceManager no-op'd (services17: UsbHandlerLegacy.setEnabledFunctions and
-   setUsbConfig).
-   - At that point sys.usb.state stays `sec_charging,adb`, the UDC is configured
-     high-speed and adbd sleeps in its USB worker.
-   - The PC cannot even re-enumerate after `adb kill-server`, so it is a phone-side
-     data-path stall.
-   - The snapshots now include kernel USB lines; look for what Lineage does at ~60-90 s
-     after unlock (the UI activator's fix_app_dirs touches adb_enabled; AdbService /
-     AdbDebuggingManager; the USB HAL calls from UsbPortManager).
-   - adb over Wi-Fi survived this on 23.2 (`echo 5555 > $STAGE/adb_tcp`).
-4. **Volume-key escape:** pressing Vol Up and Vol Down together now returns at once
-   (unit-tested, not yet pressed on the phone with this build).
+   - Root cause identified: One UI's cameraserver gave `ParcelFormatException: Not enough
+     data` because Samsung inserted proprietary methods into AIDL interfaces:
+     `notifyDeviceStateChangeSync` (tx 23) in `ICameraService` and `setParameters` (tx 13)
+     in `ICameraDeviceUser`, shifting all subsequent transaction IDs by +1. When Lineage
+     called `createDefaultRequest` (AOSP tx 23), One UI cameraserver executed
+     `notifyDeviceStateChangeSync(long)`, which failed parcel decoding.
+   - With `guest_cameraserver` (GSI cameraserver), the camera opened, but Samsung's camera
+     HAL failed configure_streams (`-19`) for multi-camera logical camera 4 because UniHAL
+     expects settings from Samsung's cameraserver SEH extension.
+   - Fix: `assets/framework17_patched.jar` (built via `tools/dexpatch/patch_camera17.py`)
+     patches the 20 shifted transaction IDs in `ICameraService$Stub$Proxy` and
+     `ICameraDeviceUser$Stub$Proxy`. `master_prepare.sh` mounts it over framework.jar,
+     and `guest_cameraserver` defaults to `off` (keeping One UI's cameraserver).
+     Toggle: `echo 0 > $STAGE/framework17_patch`.
+3. **USB adb stall ~1 min after Lineage unlocks.**
+   - Root cause identified: One UI's default `sec_charging,adb` composition is a 4-function
+     composite gadget (`ffs.mtp`, `ss_acm.0`, `ffs.adb`, `ss_mon.mtp`). In Lineage, One UI's
+     mediaserver and MtpServer are dead, leaving `ffs.mtp` endpoints unserviced. When the
+     host PC (Windows) queries MTP, the DWC3 FIFO buffer fills up and stalls all USB
+     endpoints. Windows then disables or resets the composite device.
+   - Fix: Samsung's `init.qcom.usb.rc` has a native `sys.usb.config=adb` target that
+     configures ONLY `ffs.adb` and `ss_mon.etc` (no MTP). Tested live on device:
+     re-enumerates cleanly as pure ADB without MTP. `switch_to_lineage.sh` now sets
+     `sys.usb.config adb` (saved to `saved_props`), and `adb_watchdog.sh` keeps `adb`
+     without rewriting to `sec_charging,adb`. `return_to_oneui.sh` restores One UI's
+     original composition.
+4. **Volume-key escape:** pressing Vol Up and Vol Down together returns at once
+   (unit-tested, verified on device).
 5. Smaller items:
-   - Loop devices of a session stay attached after the return (harmless now).
+   - Loop devices: fixed; leftover processes are killed and loops detach on return.
    - Duplicate cutout .frro files pile up in Lineage's resource-cache.
    - Biometrics: the owner deferred it.
 
 ## Where things are
 - assets/switch_to_lineage.sh: host side, FLAGS_TABLE, UI activator, diag, watchdogs.
-- assets/master_prepare.sh: rootfs, APEX payloads, data guards.
+- assets/master_prepare.sh: rootfs, APEX payloads, data guards, framework17_patched.
 - assets/master_inner.sh: inside the guest namespace (vold, mediaserver, cameraserver,
   zygote).
-- assets/return_to_oneui.sh: the return.
-- tools/dexpatch (services17.txt patch list), tools/voldkeeper (Rust, static musl),
+- assets/return_to_oneui.sh: the return, leftover cleanup, loop detach.
+- tools/dexpatch (services17.txt patch list, patch_camera17.py), tools/voldkeeper (Rust, static musl),
   tools/zygote_exec17, tools/frro.
 - CHANGES_TO_TEST.md: per-item device results.
 

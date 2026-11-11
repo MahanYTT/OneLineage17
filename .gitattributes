@@ -1,5 +1,6 @@
 * text=auto
 *.sh text eol=lf
+*.py text eol=lf
 preloaded-classes text eol=lf
 *.xml text eol=lf
 # zygote_exec is an aarch64 ELF, not a script. Marking it "text" let git apply
@@ -11,4 +12,5 @@ zygote_exec17 binary
 *.apk binary
 *.img binary
 *.so binary
+*.frro binary
 7zz binary

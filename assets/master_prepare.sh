@@ -274,6 +274,23 @@ if [ "$LEGACY16" = 1 ] && [ -f "$STAGE/framework_patched.jar" ]; then
     $BB mount --bind "$STAGE/framework_patched.jar" "$ROOTFS/system/framework/framework.jar"
     echo "Bound framework_patched.jar -> $ROOTFS/system/framework/framework.jar"
 fi
+# Android 17 (LineageOS 24) framework.jar: patched camera transaction IDs
+# (ICameraService and ICameraDeviceUser) to match One UI's cameraserver.
+# Samsung inserted notifyDeviceStateChangeSync (tx 23) in ICameraService and
+# setParameters (tx 13) in ICameraDeviceUser, shifting all subsequent transaction
+# IDs by +1. Lineage calling createDefaultRequest previously called
+# notifyDeviceStateChangeSync(long), throwing ParcelFormatException: Not enough data.
+# Off: echo 0 > $STAGE/framework17_patch
+if [ "$LEGACY16" = 0 ] && [ -f "$STAGE/framework17_patched.jar" ]; then
+    case "$(cat "$STAGE/framework17_patch" 2>/dev/null | tr -d ' \t\r\n')" in
+        0|off|false|no) echo "framework17_patched.jar disabled (flag)" ;;
+        *)
+            $BB umount -l "$ROOTFS/system/framework/framework.jar" 2>/dev/null || true
+            $BB mount --bind "$STAGE/framework17_patched.jar" "$ROOTFS/system/framework/framework.jar"
+            echo "Bound framework17_patched.jar -> $ROOTFS/system/framework/framework.jar"
+            ;;
+    esac
+fi
 if [ "$LEGACY16" = 1 ] && [ -f "$STAGE/preloaded-classes" ]; then
     $BB umount -l "$ROOTFS/system/etc/preloaded-classes" 2>/dev/null || true
     $BB mount --bind "$STAGE/preloaded-classes" "$ROOTFS/system/etc/preloaded-classes"

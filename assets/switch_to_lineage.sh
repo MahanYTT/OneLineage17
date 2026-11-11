@@ -119,6 +119,7 @@ guest_aconfig|auto|private aconfig flag storage (on for Android 17 images)
 host_apex|tethering cellbroadcast|Android 17 images: APEXes taken from One UI, or none
 netd_restart|auto|Android 17 images: restart netd at switch and return
 services17_patch|on|Android 17 images: patched services.jar (no vold key changes, no Weaver)
+framework17_patch|on|Android 17 images: patched framework.jar (Samsung camera transaction IDs)
 guest_fake_frp|on|private zeroed FRP partition for Lineage (protects One UI FRP)
 boot_watchdog|240|seconds until a stuck boot returns to One UI (0 = off)
 data_tripwire|on|kill Lineage if One UI user data starts disappearing
@@ -297,16 +298,10 @@ while true; do
     fi
     fixed=1
     case "$cfg" in
-        adb)
-            # Lineage's UsbDeviceManager rewrites the config to bare "adb", which
-            # Samsung's init does not know: the gadget drops and adb disappears.
-            setprop sys.usb.config sec_charging,adb 2>/dev/null
-            log "bare adb -> sec_charging,adb"
-            ;;
         *adb*) fixed=0 ;;
         ""|none)
-            setprop sys.usb.config sec_charging,adb 2>/dev/null
-            log "restored sec_charging,adb (was: $cfg)"
+            setprop sys.usb.config adb 2>/dev/null
+            log "restored adb (was: $cfg)"
             ;;
         *)
             setprop sys.usb.config "$cfg,adb" 2>/dev/null
@@ -931,6 +926,15 @@ set_prop audio.deep_buffer.media false
 set_prop audio.offload.video false
 set_prop vendor.audio.offload.track.enable false
 
+# Set USB composition to pure adb for the Lineage session. One UI's default
+# "sec_charging,adb" is a composite gadget including ffs.mtp and ss_acm.0.
+# In Lineage, One UI's mediaserver and MtpServer are gone, so nobody reads
+# /dev/usb-ffs/mtp. The PC's MTP queries then stall in the USB FIFO buffer,
+# freezing the entire USB gadget (and adb) within ~1 min. Switching to pure
+# "adb" drops the unserviced MTP function so the USB data-path never stalls.
+# return_to_oneui.sh restores One UI's original composition from saved_props.
+save_set_prop sys.usb.config adb
+
 # --- NETWORK BPF FIREWALL & DNS BYPASS ---
 echo "=== [3/6] Configuring Network BPF Filters ==="
 bpftool map update pinned /sys/fs/bpf/netd_shared/map_netd_configuration_map key hex 00 00 00 00 value hex 00 00 00 00 2>/dev/null || true
@@ -1128,16 +1132,20 @@ else
     echo "One UI mediaserver stopped (Lineage starts its own)"
 fi
 
-# Camera. Lineage's camera app talking to One UI's cameraserver (Samsung's
-# Android 17 build) fails: "ParcelFormatException: Not enough data", then
-# ERROR_CAMERA_OPEN_TIMEOUT and "a serious error occurred" (LineageOS 24 on an
-# S26 Ultra). Like mediaserver: stop One UI's and let master_inner.sh start
-# the GSI's own cameraserver, which talks to Samsung's camera HAL over the
-# standard provider interface. return_to_oneui.sh starts One UI's again.
-# auto = on for Android 17 images. Off: echo 0 > $STAGE/guest_cameraserver
+# Camera. With framework17_patched.jar aligning Lineage's camera transaction IDs
+# to One UI's cameraserver (notifyDeviceStateChangeSync and setParameters shifts),
+# Lineage can talk directly to One UI's cameraserver, which initializes Samsung's
+# camera HAL with all proprietary extensions (avoiding HAL stream config -19
+# on logical camera 4). Off: echo 1 > $STAGE/guest_cameraserver
 GCS=$(flag guest_cameraserver auto)
 if [ "$GCS" = auto ]; then
-    if [ "$(cat "$STAGE/guest_sdk" 2>/dev/null || echo 36)" -ge 37 ] 2>/dev/null; then GCS=on; else GCS=off; fi
+    if [ -f "$STAGE/framework17_patched.jar" ]; then
+        GCS=off
+    elif [ "$(cat "$STAGE/guest_sdk" 2>/dev/null || echo 36)" -ge 37 ] 2>/dev/null; then
+        GCS=on
+    else
+        GCS=off
+    fi
 fi
 if is_off "$GCS"; then
     echo 0 > "$GFLAGS/guest_cameraserver" 2>/dev/null
