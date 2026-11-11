@@ -23,7 +23,7 @@ ctl flags
 assert_grep "thermal_trip_c +97 +\(default 95\)" "$T/out" "flags shows value and default"
 assert_grep "thermal_zones +- +\(default \(cpu/gpu/nsp...\)\)" "$T/out" "flags table parses every row"
 n=$(grep -c '(default' "$T/out")
-assert_eq "$n" 40 "flags lists all 40 toggles"
+assert_eq "$n" 41 "flags lists all 41 toggles"
 
 ctl unset thermal_trip_c
 assert_no_file "$T/stage/thermal_trip_c" "unset removes the flag"

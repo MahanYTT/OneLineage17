@@ -50,6 +50,37 @@ pkill -9 -x zygote64 2>/dev/null || true
 pkill -9 -x zygote_next 2>/dev/null || true
 kill -9 $(pidof surfaceflinger) 2>/dev/null || true
 
+# Lineage's vold took over the binder name "vold" from One UI's vold (which
+# kept running). Stop it, then let voldkeeper (started by switch_to_lineage.sh)
+# register One UI's vold as "vold" again before One UI's system_server starts:
+# otherwise it cannot commit the userdata checkpoint and the phone reboots
+# ("reboot,checkpoint_commit_failed"). Only a vold that is not one of the PIDs
+# recorded before the session AND lives in another mount namespace than One
+# UI's vold is killed.
+STAGE_DIR=/data/local/tmp/lineage_stage
+HOST_VOLDS=$(cat "$STAGE_DIR/host_vold_pids" 2>/dev/null)
+if [ -n "$HOST_VOLDS" ]; then
+    set -- $HOST_VOLDS
+    HOST_VOLD_NS=$(readlink "/proc/$1/ns/mnt" 2>/dev/null)
+    for p in $(pidof vold); do
+        case " $HOST_VOLDS " in *" $p "*) continue ;; esac
+        ns=$(readlink "/proc/$p/ns/mnt" 2>/dev/null)
+        if [ -n "$HOST_VOLD_NS" ] && [ -n "$ns" ] && [ "$ns" != "$HOST_VOLD_NS" ]; then
+            kill -9 "$p" 2>/dev/null && echo "Stopped Lineage vold (pid $p)"
+        fi
+    done
+fi
+if [ "$(cat "$STAGE_DIR/vold_keeper.state" 2>/dev/null)" = held ]; then
+    touch "$STAGE_DIR/vold_restore"
+    i=0
+    while [ $i -lt 40 ] && [ "$(cat "$STAGE_DIR/vold_keeper.state" 2>/dev/null)" = held ]; do
+        sleep 0.25; i=$((i + 1))
+    done
+    echo "vold keeper: $(cat "$STAGE_DIR/vold_keeper.state" 2>/dev/null)"
+fi
+pkill -9 -f "voldkeeper hold" 2>/dev/null || true
+rm -f "$STAGE_DIR/vold_restore"
+
 # Put the host's own /data trees back FIRST: master_prepare.sh bridges the
 # staged app trees (installd/artd write there), and the One UI launcher restore
 # below must read the host's real /data/user/0, not the guest's.

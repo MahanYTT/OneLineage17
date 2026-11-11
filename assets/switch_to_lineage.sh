@@ -130,6 +130,7 @@ net_bounce|0|allow toggling Wi-Fi as a last-resort DNS fix
 density|540|guest display density (dpi)
 font_scale|(unset)|guest font scale, e.g. 0.9
 guest_mediaserver|on|run the Lineage mediaserver instead of the One UI one
+vold_keeper|on|re-register One UI vold as vold on return (avoids a reboot)
 frro_fix|on|rebuild runtime-overlay idmaps for Lineage (cutout, theme colours)
 adb_framework_block|off|experiment: hide the adbd control socket from Lineage
 key_escape|on|hold Volume Up + Down 3 s to return to One UI
@@ -1143,6 +1144,26 @@ if [ -f "$STAGE/zygote_exec17" ]; then
     chmod 755 "$STAGE/data/zygote_exec17"
 fi
 
+# vold keeper. Lineage's vold (started by master_inner.sh) registers the
+# binder name "vold" in the servicemanager it shares with One UI, replacing One
+# UI's vold, which keeps running. After return_to_oneui.sh kills Lineage's vold
+# nothing is "vold" any more, One UI's system_server cannot commit the userdata
+# checkpoint and the phone reboots ("reboot,checkpoint_commit_failed", seen on
+# an S26 Ultra after a LineageOS 24 session). voldkeeper takes a reference to
+# One UI's vold now and registers it as "vold" again on return. Lineage cannot
+# use One UI's vold instead: the IVold call numbers differ (a LineageOS 24 boot
+# without its own vold died on a NullPointerException from supportsCheckpoint).
+# Off: echo 0 > $STAGE/vold_keeper
+rm -f "$STAGE/vold_keeper.state" "$STAGE/vold_restore"
+pidof vold > "$STAGE/host_vold_pids" 2>/dev/null
+if ! is_off "$(flag vold_keeper on)" && [ -x "$STAGE/voldkeeper" ]; then
+    nohup "$STAGE/voldkeeper" hold "$STAGE" </dev/null >/dev/null 2>&1 &
+    i=0; while [ $i -lt 20 ] && [ ! -s "$STAGE/vold_keeper.state" ]; do sleep 0.25; i=$((i + 1)); done
+    echo "vold keeper: $(cat "$STAGE/vold_keeper.state" 2>/dev/null || echo 'not started')"
+else
+    echo "vold keeper off: One UI may reboot after the session (checkpoint_commit_failed)"
+fi
+
 # Launch takeover inside isolated mount namespace
 set_prop sys.boot_completed 0
 $BB unshare -m $BB sh "$STAGE/data/master_inner.sh" </dev/null >"$STAGE/data/takeover.log" 2>&1 &
@@ -1236,7 +1257,14 @@ while true; do
         echo "--- isub/sim"; nsenter -t "$P" -m -- /system/bin/dumpsys isub 2>&1 | head -40
         echo "--- ip"; ip addr 2>&1 | grep -E "wlan|rmnet|inet " | head -20
         echo "--- networkstack query"; nsenter -t "$P" -m -- /system/bin/cmd package query-services -a android.net.INetworkStackConnector 2>&1 | head -20
-        echo "--- networkstack package"; nsenter -t "$P" -m -- /system/bin/dumpsys package com.google.android.networkstack 2>&1 | grep -E "versionName|codePath|flags=|privateFlags|signatures|MAINLINE_NETWORK_STACK|Service|android.net.INetworkStackConnector|enabled|granted=false" | head -40
+        echo "--- network packages"; nsenter -t "$P" -m -- /system/bin/pm list packages -f -u 2>&1 | grep -i -E "networkstack|tethering|cellbroadcast|permissionconfig" | head -20
+        echo "--- networkstack dirs"; nsenter -t "$P" -m -- ls -la /system/priv-app/NetworkStack 2>&1 | head
+        for pk in com.google.android.networkstack com.android.networkstack; do
+            echo "--- package $pk"; nsenter -t "$P" -m -- /system/bin/dumpsys package "$pk" 2>&1 | grep -E "Package \[|codePath|versionName|flags=|MAINLINE_NETWORK_STACK|INetworkStackConnector|enabled=" | head -20
+        done
+        echo "--- display"; nsenter -t "$P" -m -- /system/bin/dumpsys display 2>&1 | grep -i -E "supportedModes|mActiveModeId|mDefaultModeId|mUserPreferredMode|renderFrameRate|refreshRate=" | head -12
+        echo "--- refresh settings"; for k in peak_refresh_rate min_refresh_rate user_refresh_rate; do echo "$k=$(nsenter -t "$P" -m -- /system/bin/settings get system $k 2>&1)"; done
+        echo "--- sf"; nsenter -t "$P" -m -- /system/bin/dumpsys SurfaceFlinger 2>&1 | grep -i -E "activeMode|refresh rate|vsync period|RefreshRateSelector|Display modes|desiredMode" | head -12
     } > "$f" 2>&1
 done
 DIAG_SH

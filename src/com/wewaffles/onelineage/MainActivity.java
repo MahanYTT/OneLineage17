@@ -665,7 +665,7 @@ public class MainActivity extends Activity {
             String[] assets = {
                 "switch_to_lineage.sh", "return_to_oneui.sh",
                 "master_prepare.sh", "master_inner.sh",
-                "zygote_exec", "zygote_exec17", "services17_patched.jar", "service-art17_patched.jar", "clean_apex_info_list.xml",
+                "zygote_exec", "zygote_exec17", "voldkeeper", "services17_patched.jar", "service-art17_patched.jar", "clean_apex_info_list.xml",
                 "services_patched.jar", "framework_patched.jar",
                 "7zz", "PermissionController_patched.apk",
                 "preloaded-classes"
@@ -699,7 +699,7 @@ public class MainActivity extends Activity {
                         "  cp -f \"$f\" \"" + STAGE_DIR + "/$base\"; " +
                         "done && " +
                         "cp -f " + filesDir.getAbsolutePath() + "/7zz /data/local/tmp/7zz 2>/dev/null; " +
-                        "chmod 755 " + STAGE_DIR + "/*.sh " + STAGE_DIR + "/zygote_exec " + STAGE_DIR + "/zygote_exec17 " + STAGE_DIR + "/7zz /data/local/tmp/7zz 2>/dev/null"
+                        "chmod 755 " + STAGE_DIR + "/*.sh " + STAGE_DIR + "/zygote_exec " + STAGE_DIR + "/zygote_exec17 " + STAGE_DIR + "/voldkeeper " + STAGE_DIR + "/7zz /data/local/tmp/7zz 2>/dev/null"
                     }).waitFor();
                 } catch (Exception ignored) {}
             }
@@ -1058,7 +1058,7 @@ public class MainActivity extends Activity {
                                  "  base=$(basename \"$f\"); " +
                                  "  cp -f \"$f\" \"" + STAGE_DIR + "/$base\"; " +
                                  "done && " +
-                                 "chmod 755 " + STAGE_DIR + "/*.sh " + STAGE_DIR + "/zygote_exec " + STAGE_DIR + "/zygote_exec17 " + STAGE_DIR + "/7zz";
+                                 "chmod 755 " + STAGE_DIR + "/*.sh " + STAGE_DIR + "/zygote_exec " + STAGE_DIR + "/zygote_exec17 " + STAGE_DIR + "/voldkeeper " + STAGE_DIR + "/7zz";
                 Runtime.getRuntime().exec(new String[]{suBinary, "-c", syncCmd}).waitFor();
 
                 String stageScript = STAGE_DIR + "/switch_to_lineage.sh";
