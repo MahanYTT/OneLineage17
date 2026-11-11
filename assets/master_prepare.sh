@@ -3,6 +3,28 @@ STAGE="/data/local/tmp/lineage_stage"
 ROOTFS="$STAGE/rootfs"
 BB=$(which busybox 2>/dev/null || echo "/data/adb/ksu/bin/busybox")
 
+# Attach an image to a free loop device and print the device. "losetup -f"
+# hands out a new loop number whose /dev/block node ueventd creates a moment
+# later; attaching right away failed with "No such file or directory" for
+# every second APEX payload (then "mount ... I/O error"), and Lineage booted
+# with One UI's Bluetooth APEX in place of its own (system_server died on a
+# missing Samsung class, seen on an S26 Ultra). Wait for the node and retry.
+attach_loop() {
+    _img="$1"; _try=0
+    while [ $_try -lt 5 ]; do
+        _l=$($BB losetup -f 2>/dev/null)
+        if [ -n "$_l" ]; then
+            _w=0
+            while [ ! -b "$_l" ] && [ $_w -lt 20 ]; do sleep 0.1; _w=$((_w + 1)); done
+            if $BB losetup "$_l" "$_img" 2>/dev/null; then
+                echo "$_l"; return 0
+            fi
+        fi
+        sleep 0.3; _try=$((_try + 1))
+    done
+    return 1
+}
+
 # Filesystem of an image file, from its magic bytes: LineageOS 23.2 (Android
 # 16) images and APEX payloads are ext4, Android 17 builds may use erofs.
 img_fstype() {
@@ -55,9 +77,8 @@ if ! mount | grep -q "$ROOTFS "; then
     for l in $($BB losetup -a | grep "system.raw" | cut -d: -f1); do
         $BB losetup -d "$l" 2>/dev/null || true
     done
-    LOOP=$($BB losetup -f)
-    $BB losetup "$LOOP" "$STAGE/system.raw"
-    echo "Using LOOP: $LOOP"
+    LOOP=$(attach_loop "$STAGE/system.raw")
+    echo "Using LOOP: ${LOOP:-none (attach failed)}"
     $BB mount -t "$(img_fstype "$STAGE/system.raw")" -o ro "$LOOP" "$ROOTFS"
 fi
 
@@ -172,8 +193,7 @@ case "$(cat "$STAGE/guest_fake_frp" 2>/dev/null | tr -d ' \t\r\n')" in
             fi
             FRP_LOOP=$($BB losetup -a | grep "$STAGE/fake_frp.img" | head -n 1 | cut -d: -f1)
             if [ -z "$FRP_LOOP" ]; then
-                FRP_LOOP=$($BB losetup -f)
-                $BB losetup "$FRP_LOOP" "$STAGE/fake_frp.img"
+                FRP_LOOP=$(attach_loop "$STAGE/fake_frp.img")
             fi
             # Same owner, mode and label as the real node: Lineage's
             # system_server (uid system) opens it ("EACCES" with root:root).
@@ -893,6 +913,8 @@ if [ "$LEGACY16" = 0 ]; then
     echo "APEXes taken from One UI: ${HOST_APEX:-none}"
 fi
 
+
+PAYLOAD_FAIL=""
 mount_payload() {
     NAME="$1"
     TARGET="$2"
@@ -927,10 +949,18 @@ mount_payload() {
     fi
     mkdir -p "$DEST"
     $BB umount -l "$DEST" 2>/dev/null || true
-    LOOP=$($BB losetup -f)
-    $BB losetup "$LOOP" "$IMG"
+    LOOP=$(attach_loop "$IMG")
+    if [ -z "$LOOP" ]; then
+        echo "!!! $NAME: could not attach $IMG to a loop device"
+        PAYLOAD_FAIL="$PAYLOAD_FAIL $NAME"
+        return 0
+    fi
     PFS=$(img_fstype "$IMG")
-    $BB mount -t "$PFS" -o ro "$LOOP" "$DEST"
+    if ! $BB mount -t "$PFS" -o ro "$LOOP" "$DEST"; then
+        echo "!!! $NAME: mounting $LOOP on $DEST failed"
+        PAYLOAD_FAIL="$PAYLOAD_FAIL $NAME"
+        return 0
+    fi
     echo "Direct mounted $NAME on $LOOP -> $DEST"
     for vdir in "$ROOTFS/apex/${TARGET}"@*; do
         if [ -d "$vdir" ]; then
@@ -992,6 +1022,7 @@ mount_payload "apex.cts.shim" "com.android.apex.cts.shim"
 # Android 17 (LineageOS 24) only; skipped when the image has no such APEX.
 mount_payload "npumanager" "com.android.npumanager"
 mount_payload "webapp" "com.android.webapp"
+[ -n "$PAYLOAD_FAIL" ] && echo "!!! APEX payloads NOT mounted (Lineage may boot with One UI's):$PAYLOAD_FAIL"
 
 # Payload extractions above used the GSI's own /system/apex and /system/system_ext/apex
 # files. Now that the images are cached, present the HOST's /system/apex and

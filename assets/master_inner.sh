@@ -103,6 +103,18 @@ case "$(cat /data/local/tmp/lineage_flags/guest_mediaserver 2>/dev/null | tr -d 
         fi ;;
 esac
 
+# Lineage's own cameraserver (see "Camera" in switch_to_lineage.sh, which
+# stopped One UI's and resolved the flag).
+case "$(cat /data/local/tmp/lineage_flags/guest_cameraserver 2>/dev/null | tr -d ' \t\r\n')" in
+    1)
+        if [ -x /system/bin/cameraserver ]; then
+            /system/bin/cameraserver > /data/cameraserver.log 2>&1 &
+            echo "[Pivoted Root] cameraserver PID: $!"
+        else
+            echo "[Pivoted Root] WARNING: no cameraserver binary in the GSI"
+        fi ;;
+esac
+
 # Overlay idmaps. idmap2 refuses the GSI's product overlays because framework-res
 # does not declare the targeted resources as overlayable, so OMS ends up with no
 # idmap at all and silently ignores every overlay: gesture navigation never

@@ -85,3 +85,11 @@ Lcom/android/server/devicepolicy/FactoryResetter;:factoryResetInternalUnchecked
 Lcom/android/server/MasterClearReceiver;:onReceive
 Lcom/android/server/MasterClearReceiver;:wipeUser:0
 Lcom/android/server/devicepolicy/DevicePolicyManagerService;:wipeDataNoLock
+# USB (One UI's init handles sys.usb.config; Lineage shares the property).
+# Lineage's UsbDeviceManager runs its legacy handler ("USB Gadget HAL
+# AIDL/HIDL not present"), sets sys.usb.config to none and bare "adb" and
+# fought the adb watchdog ("Failsafe 2: Restoring default USB functions",
+# adbd restarted 3 times, USB adb lost for the whole session). Leave One
+# UI's USB configuration alone.
+Lcom/android/server/usb/UsbDeviceManager$UsbHandlerLegacy;:setEnabledFunctions
+Lcom/android/server/usb/UsbDeviceManager$UsbHandlerLegacy;:setUsbConfig

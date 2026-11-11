@@ -130,10 +130,12 @@ net_bounce|0|allow toggling Wi-Fi as a last-resort DNS fix
 density|540|guest display density (dpi)
 font_scale|(unset)|guest font scale, e.g. 0.9
 guest_mediaserver|on|run the Lineage mediaserver instead of the One UI one
+guest_cameraserver|auto|run the Lineage cameraserver (auto = on for Android 17)
 vold_keeper|on|re-register One UI vold as vold on return (avoids a reboot)
+statusbar_fix|on|One UI-like status bar height and padding (Lineage)
 frro_fix|on|rebuild runtime-overlay idmaps for Lineage (cutout, theme colours)
 adb_framework_block|off|experiment: hide the adbd control socket from Lineage
-key_escape|on|hold Volume Up + Down 3 s to return to One UI
+key_escape|on|press Volume Up + Down together to return to One UI
 cutout_fix|on|give the guest the One UI camera cutout (status bar position)
 adb_tcp|0|adb over Wi-Fi port (e.g. 5555), next Switch
 adb_watchdog_interval|1|seconds between adb watchdog checks'
@@ -363,10 +365,12 @@ fi
 
 # --- VOLUME-KEY ESCAPE -----------------------------------------------------
 # When adb is dead and Lineage misbehaves, the only way back used to be a hard
-# restart. Holding Volume Up + Volume Down together for 3 s now runs
-# return_to_oneui.sh. It reads key events from the host namespace with
-# getevent (it does not grab the devices, Lineage still sees the keys).
-# Off: echo 0 > $STAGE/key_escape    Hold time: echo 5 > $STAGE/key_escape_secs
+# restart. Pressing Volume Up + Volume Down together runs return_to_oneui.sh
+# (it used to need a 3 s hold, and short presses of both keys did nothing,
+# which is what people actually do). It reads key events from the host
+# namespace with getevent (it does not grab the devices, Lineage still sees
+# the keys). Screenshots are Power + Volume Down and do not trigger it.
+# Off: echo 0 > $STAGE/key_escape    Require a hold: echo 3 > $STAGE/key_escape_secs
 pkill -f "key_escape.sh" 2>/dev/null || true
 if is_off "$(flag key_escape on)"; then
     echo "volume-key escape disabled by $STAGE/key_escape"
@@ -379,12 +383,20 @@ RETURN_SCRIPT=${RETURN_SCRIPT:-$STAGE/return_to_oneui.sh}
 GETEVENT=${GETEVENT:-getevent -lq}
 SH=${KEYESC_SH:-/system/bin/sh}
 HOLD=$(cat "$STAGE/key_escape_secs" 2>/dev/null | tr -dc '0-9')
-[ -n "$HOLD" ] && [ "$HOLD" -gt 0 ] || HOLD=3
+[ -n "$HOLD" ] || HOLD=0
 BOTH=${KEYESC_STATE:-/data/local/tmp/key_escape.both}
 log() { echo "$(date) $*" >> "$LOG"; }
 rm -f "$BOTH"
 up=0; down=0
 log "key escape armed (hold ${HOLD}s)"
+go_back() {
+    log "$1 -> returning to One UI"
+    if command -v setsid >/dev/null 2>&1; then
+        setsid "$SH" "$RETURN_SCRIPT" </dev/null >"$STAGE/key_escape_return.log" 2>&1 &
+    else
+        nohup "$SH" "$RETURN_SCRIPT" </dev/null >"$STAGE/key_escape_return.log" 2>&1 &
+    fi
+}
 $GETEVENT 2>/dev/null | while read -r dev typ key val rest; do
     [ "$typ" = EV_KEY ] || continue
     case "$val" in DOWN) v=1 ;; UP) v=0 ;; *) continue ;; esac
@@ -395,19 +407,18 @@ $GETEVENT 2>/dev/null | while read -r dev typ key val rest; do
         *) continue ;;
     esac
     if [ "$up" = 1 ] && [ "$down" = 1 ]; then
+        if [ "$HOLD" -eq 0 ]; then
+            go_back "both volume keys pressed"
+            exit 0
+        fi
         if [ ! -f "$BOTH" ]; then
             tok=$$.$(date +%s)
             echo "$tok" > "$BOTH"
             # Fire only if this very press is still held after HOLD seconds.
             ( sleep "$HOLD"
               if [ "$(cat "$BOTH" 2>/dev/null)" = "$tok" ]; then
-                  echo "$(date) both volume keys held ${HOLD}s -> returning to One UI" >> "$LOG"
                   rm -f "$BOTH"
-                  if command -v setsid >/dev/null 2>&1; then
-                      setsid "$SH" "$RETURN_SCRIPT" </dev/null >"$STAGE/key_escape_return.log" 2>&1 &
-                  else
-                      nohup "$SH" "$RETURN_SCRIPT" </dev/null >"$STAGE/key_escape_return.log" 2>&1 &
-                  fi
+                  go_back "both volume keys held ${HOLD}s"
               fi ) &
         fi
     else
@@ -421,7 +432,7 @@ KEYESC
     else
         nohup /system/bin/sh /data/local/tmp/key_escape.sh </dev/null >/dev/null 2>&1 &
     fi
-    echo "volume-key escape started (hold Volume Up + Down to return to One UI)"
+    echo "volume-key escape started (press Volume Up + Down together to return to One UI)"
 fi
 
 # --- THERMAL SAFETY VALVE (untested on device) ----------------------------
@@ -1117,6 +1128,28 @@ else
     echo "One UI mediaserver stopped (Lineage starts its own)"
 fi
 
+# Camera. Lineage's camera app talking to One UI's cameraserver (Samsung's
+# Android 17 build) fails: "ParcelFormatException: Not enough data", then
+# ERROR_CAMERA_OPEN_TIMEOUT and "a serious error occurred" (LineageOS 24 on an
+# S26 Ultra). Like mediaserver: stop One UI's and let master_inner.sh start
+# the GSI's own cameraserver, which talks to Samsung's camera HAL over the
+# standard provider interface. return_to_oneui.sh starts One UI's again.
+# auto = on for Android 17 images. Off: echo 0 > $STAGE/guest_cameraserver
+GCS=$(flag guest_cameraserver auto)
+if [ "$GCS" = auto ]; then
+    if [ "$(cat "$STAGE/guest_sdk" 2>/dev/null || echo 36)" -ge 37 ] 2>/dev/null; then GCS=on; else GCS=off; fi
+fi
+if is_off "$GCS"; then
+    echo 0 > "$GFLAGS/guest_cameraserver" 2>/dev/null
+    echo "keeping One UI's cameraserver"
+else
+    echo 1 > "$GFLAGS/guest_cameraserver" 2>/dev/null
+    setprop ctl.stop cameraserver 2>/dev/null
+    sleep 0.5
+    kill -9 $(pidof cameraserver) 2>/dev/null || true
+    echo "One UI cameraserver stopped (Lineage starts its own)"
+fi
+
 # netd restart (Android 17+ images). The DNS resolver inside netd hands out
 # IDnsResolver.getUnstableInterface() once per caller uid; One UI's
 # system_server already took it at boot, so Lineage's ConnectivityService
@@ -1169,6 +1202,13 @@ set_prop sys.boot_completed 0
 $BB unshare -m $BB sh "$STAGE/data/master_inner.sh" </dev/null >"$STAGE/data/takeover.log" 2>&1 &
 TAKEOVER_PID=$!
 echo "Takeover daemon PID: $TAKEOVER_PID"
+# Remember Lineage's mount namespace: return_to_oneui.sh stops everything
+# left in it.
+sleep 1
+_gns=$(readlink "/proc/$TAKEOVER_PID/ns/mnt" 2>/dev/null)
+if [ -n "$_gns" ] && [ "$_gns" != "$(readlink /proc/self/ns/mnt)" ]; then
+    echo "$_gns" > "$STAGE/guest_mnt_ns"
+fi
 
 if [ "${START_CRASHLOOP_GUARD:-0}" = 1 ]; then
     if command -v setsid >/dev/null 2>&1; then
@@ -1247,10 +1287,45 @@ while true; do
     P=$(pidof system_server)
     [ -n "$P" ] || continue
     f="$D/snap_$((i % 4)).txt"
+    # Timed test sessions only ($STAGE/session_minutes): screenshots of the
+    # home screen and the pulled-down notification shade (status bar layout),
+    # then open the camera app once and screenshot it. Never shared: they
+    # stay in $D on the phone.
+    if [ -n "$(cat /data/local/tmp/lineage_stage/session_minutes 2>/dev/null | tr -dc '1-9')" ]; then
+        g() { nsenter -t "$P" -m -- "$@"; }
+        case $i in
+            2) g /system/bin/screencap -p > "$D/shot_home.png" 2>/dev/null
+               g /system/bin/cmd statusbar expand-notifications >/dev/null 2>&1; sleep 2
+               g /system/bin/screencap -p > "$D/shot_shade.png" 2>/dev/null
+               g /system/bin/cmd statusbar expand-settings >/dev/null 2>&1; sleep 2
+               g /system/bin/screencap -p > "$D/shot_qs.png" 2>/dev/null
+               g /system/bin/cmd statusbar collapse >/dev/null 2>&1 ;;
+            3) T0=$(date '+%m-%d %H:%M:%S.000')
+               g /system/bin/am start -W -a android.media.action.STILL_IMAGE_CAMERA > "$D/camera_start.txt" 2>&1
+               sleep 8
+               g /system/bin/screencap -p > "$D/shot_camera.png" 2>/dev/null
+               dumpsys media.camera 2>&1 | head -60 > "$D/camera_service.txt"
+               logcat -d -b main,system,crash -T "$T0" 2>/dev/null | grep -i -E "camera|aperture|AndroidRuntime|CameraX|CXCP|Unihal|Chi " | grep -v adsprpc | tail -300 > "$D/camera_log.txt"
+               g /system/bin/input keyevent KEYCODE_HOME >/dev/null 2>&1 ;;
+            4) T0=$(date '+%m-%d %H:%M:%S.000')
+               g /system/bin/am start -W -a android.media.action.STILL_IMAGE_CAMERA --ei android.intent.extras.CAMERA_FACING 1 --ez android.intent.extra.USE_FRONT_CAMERA true > "$D/camera1_start.txt" 2>&1
+               sleep 8
+               g /system/bin/screencap -p > "$D/shot_camera1.png" 2>/dev/null
+               logcat -d -b main,system,crash -T "$T0" 2>/dev/null | grep -i -E "camera|aperture|AndroidRuntime|CXCP|Unihal|Chi " | grep -v adsprpc | tail -300 > "$D/camera1_log.txt"
+               g /system/bin/input keyevent KEYCODE_HOME >/dev/null 2>&1 ;;
+        esac
+    fi
     {
         echo "=== $(date) system_server=$P"
         echo "--- key escape: $(pidof getevent) $(ps -A -o PID,ARGS 2>/dev/null | grep -c '[k]ey_escape.sh')"
         echo "--- user 0: $(nsenter -t "$P" -m -- /system/bin/am get-started-user-state 0 2>&1)"
+        echo "--- adbd/usb: usb.state=$(getprop sys.usb.state) config=$(getprop sys.usb.config) ffs.ready=$(getprop sys.usb.ffs.ready)"
+        for u in /sys/class/udc/*; do echo "udc ${u##*/}: $(cat "$u/state" 2>/dev/null) speed=$(cat "$u/current_speed" 2>/dev/null)"; done
+        echo "gadget UDC=$(cat /config/usb_gadget/g1/UDC 2>/dev/null)"
+        for a in $(pidof adbd); do
+            echo "adbd $a: $(grep -E '^State' /proc/$a/status | tr -s '\t ' ' ') cgroup=$(tr '\n' ' ' < /proc/$a/cgroup)"
+            for t in /proc/$a/task/*; do echo "  ${t##*/} $(cat $t/comm) $(grep -E '^State' $t/status | cut -f2) wchan=$(cat $t/wchan 2>/dev/null)"; done
+        done
         echo "--- wifi"; nsenter -t "$P" -m -- /system/bin/dumpsys wifi 2>&1 | head -150
         echo "--- connectivity"; nsenter -t "$P" -m -- /system/bin/dumpsys connectivity 2>&1 | head -80
         echo "--- telephony"; nsenter -t "$P" -m -- /system/bin/dumpsys telephony.registry 2>&1 | grep -E "mServiceState|mDataConnectionState|mSignalStrength|mCallState|SIM" | head -20
@@ -1377,7 +1452,36 @@ skip_setup() {
 # and its rect approximation; the GSI's noCutout overlays are switched off so
 # ours wins. Everything is logged so a wrong result can be undone with
 # `cmd overlay disable` or by turning cutout_fix off.
+# Status bar layout like One UI's. One UI: status bar 149 px, icons centred
+# ~85 px down, ~45-50 px from both edges. Lineage (S26 Ultra, density 540):
+# 139 px (just the cutout), icons ~17 px higher, clock 30 px from the left
+# corner and a 95 px gap on the right. Fabricated dimension overlays, values in
+# px. "cmd overlay fabricate" refuses the raw type 0x05 ("dataType is out of
+# range of [16, 31]"), so the type name "dimen" with "149px" is tried first,
+# then the encoded TypedValue complex (integer mantissa << 8, unit px = 0).
+# Off: echo 0 > $STAGE/statusbar_fix. Values: $STAGE/statusbar_height (149),
+# statusbar_pad_top (20), statusbar_pad_start (48), statusbar_pad_end (0).
+apply_statusbar_layout() {
+    is_off "$(flag statusbar_fix on)" && { echo "[UI Activator] status bar layout fix off"; return 0; }
+    fab() {
+        o=$(gx /system/bin/cmd overlay fabricate --target "$1" --name "$2" "$3" dimen "${4}px" 2>&1)
+        [ -n "$o" ] && o="$o / $(gx /system/bin/cmd overlay fabricate --target "$1" --name "$2" "$3" 0x05 "$(( $4 << 8 ))" 2>&1)"
+        echo "[UI Activator] fabricate $3=$4px: ${o:-ok}"
+    }
+    H=$(flag statusbar_height 149)
+    fab android ol_sb_height_default android:dimen/status_bar_height_default "$H"
+    fab android ol_sb_height_portrait android:dimen/status_bar_height_portrait "$H"
+    fab com.android.systemui ol_sb_pad_top com.android.systemui:dimen/status_bar_padding_top "$(flag statusbar_pad_top 20)"
+    fab com.android.systemui ol_sb_pad_start com.android.systemui:dimen/status_bar_padding_start "$(flag statusbar_pad_start 48)"
+    fab com.android.systemui ol_sb_pad_end com.android.systemui:dimen/status_bar_padding_end "$(flag statusbar_pad_end 0)"
+    for ov in $(gx /system/bin/cmd overlay list 2>/dev/null | grep -o '[^ ]*:ol_sb_[a-z_]*'); do
+        o=$(gx /system/bin/cmd overlay enable "$ov" 2>&1)
+        echo "[UI Activator] enable $ov: ${o:-ok}"
+    done
+}
+
 apply_cutout() {
+    apply_statusbar_layout
     is_off "$(flag cutout_fix on)" && { echo "[UI Activator] cutout fix off"; return 0; }
     spec=$(cat "$STAGE/cutout_spec" 2>/dev/null)
     [ -n "$spec" ] || spec=$(cat "$STAGE/cutout_spec.auto" 2>/dev/null)

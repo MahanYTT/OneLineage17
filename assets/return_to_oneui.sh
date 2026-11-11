@@ -53,6 +53,28 @@ pkill -9 -x zygote64 2>/dev/null || true
 pkill -9 -x zygote_next 2>/dev/null || true
 kill -9 $(pidof surfaceflinger) 2>/dev/null || true
 
+# Everything still running in Lineage's mount namespace (recorded by
+# switch_to_lineage.sh at launch) goes before One UI starts. Lineage's
+# NetworkStack process outlived the return once and One UI's system_server
+# died on its stale Tethering connector ("TetheringManager ...
+# DeadObjectException", S26 Ultra). Never our own or init's namespace.
+STAGE_DIR=/data/local/tmp/lineage_stage
+GUEST_NS=$(cat "$STAGE_DIR/guest_mnt_ns" 2>/dev/null)
+# Only trust it when it was written since this boot (namespace ids are
+# reused after a reboot).
+BOOT_T=$(( $(date +%s) - $(cut -d. -f1 /proc/uptime) ))
+[ "$(stat -c %Y "$STAGE_DIR/guest_mnt_ns" 2>/dev/null || echo 0)" -gt "$BOOT_T" ] 2>/dev/null || GUEST_NS=""
+if [ -n "$GUEST_NS" ] && [ "$GUEST_NS" != "$(readlink /proc/self/ns/mnt)" ] &&    [ "$GUEST_NS" != "$(readlink /proc/1/ns/mnt)" ]; then
+    n=0
+    for d in /proc/[0-9]*; do
+        p=${d#/proc/}
+        [ "$p" = "$$" ] && continue
+        [ "$(readlink "$d/ns/mnt" 2>/dev/null)" = "$GUEST_NS" ] && kill -9 "$p" 2>/dev/null && n=$((n + 1))
+    done
+    echo "Stopped $n processes left in Lineage's namespace"
+fi
+rm -f "$STAGE_DIR/guest_mnt_ns"
+
 # Lineage's vold took over the binder name "vold" from One UI's vold (which
 # kept running). Stop it, then let voldkeeper (started by switch_to_lineage.sh)
 # register One UI's vold as "vold" again before One UI's system_server starts:
@@ -60,7 +82,6 @@ kill -9 $(pidof surfaceflinger) 2>/dev/null || true
 # ("reboot,checkpoint_commit_failed"). Only a vold that is not one of the PIDs
 # recorded before the session AND lives in another mount namespace than One
 # UI's vold is killed.
-STAGE_DIR=/data/local/tmp/lineage_stage
 HOST_VOLDS=$(cat "$STAGE_DIR/host_vold_pids" 2>/dev/null)
 if [ -n "$HOST_VOLDS" ]; then
     set -- $HOST_VOLDS
@@ -128,7 +149,9 @@ while [ $n -lt 20 ]; do
 done
 BB=$(which busybox 2>/dev/null || echo /data/adb/ksu/bin/busybox)
 if [ -x "$BB" ]; then
-    for l in $($BB losetup -a | grep "system.raw" | cut -d: -f1); do
+    # Every loop device of the session (image, APEX payloads, fake FRP):
+    # left attached, each session needed new loop numbers.
+    for l in $($BB losetup -a | grep "/data/local/tmp/lineage_stage/" | cut -d: -f1); do
         $BB losetup -d "$l" 2>/dev/null || true
     done
 fi

@@ -1,6 +1,7 @@
 #!/bin/sh
 # Unit tests for the volume-key escape embedded in switch_to_lineage.sh.
-# A fake getevent replays key events with real short pauses; HOLD is 1 s.
+# A fake getevent replays key events with real short pauses; HOLD is 1 s
+# unless a test removes key_escape_secs (default: no hold).
 . "$(dirname "$0")/lib.sh"
 echo "key_escape"
 KE=$(extract switch_to_lineage__KEYESC)
@@ -74,5 +75,31 @@ KEY_POWER UP
 EOF
 replay "$T/ev"
 assert_no_file "$T/returned" "power + volume down (screenshot): nothing happens"
+
+setup
+rm -f "$T/stage/key_escape_secs"
+cat > "$T/ev" <<EOF
+KEY_VOLUMEUP DOWN
+KEY_VOLUMEDOWN DOWN
+sleep 0.2
+KEY_VOLUMEDOWN UP
+KEY_VOLUMEUP UP
+EOF
+replay "$T/ev"
+assert_file "$T/returned" "default: a short press of both keys returns to One UI"
+assert_grep "both volume keys pressed" "$T/log" "default: logs the press"
+
+setup
+rm -f "$T/stage/key_escape_secs"
+cat > "$T/ev" <<EOF
+KEY_VOLUMEUP DOWN
+KEY_VOLUMEUP UP
+KEY_VOLUMEDOWN DOWN
+KEY_VOLUMEDOWN UP
+KEY_VOLUMEUP DOWN
+KEY_VOLUMEUP UP
+EOF
+replay "$T/ev"
+assert_no_file "$T/returned" "default: separate presses do nothing"
 
 finish
